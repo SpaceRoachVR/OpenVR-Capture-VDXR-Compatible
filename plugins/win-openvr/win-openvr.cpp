@@ -311,6 +311,11 @@ static void win_openvr_init(void *data, bool forced)
 	// init leaves a dangling SRV that crashes on the next SteamVR shutdown.
 	auto on_failure = [context]() {
 		release_mirror_texture_locked(context);
+		// A failed forced refresh (game switched/exited) must not leave the
+		// source "initialized": render would keep drawing a frozen frame and
+		// tick would retry the forced path, bypassing backoff, every frame.
+		// Dropping it hands retries to the normal backoff path in tick().
+		context->initialized.store(false);
 		context->retry_delayBUFFER_current = std::min(context->retry_delayBUFFER_current * 2, retry_delayBUFFER_max);
 		context->init_inprog.store(false);
 	};
@@ -522,7 +527,13 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 	}
 	} // context->mutex released here
 
-	if (needs_reinit) {
+	if (context->engine_mode == CaptureEngineMode::OpenXR_VDXR) {
+		// Switched to OpenXR-only: release the SteamVR mirror, D3D device and
+		// runtime reference instead of keeping them alive unused.
+		if (context->vr_initialized.load() || context->initialized.load()) {
+			win_openvr_deinit(data);
+		}
+	} else if (needs_reinit) {
 		win_openvr_init(data, true);
 	}
 }
@@ -632,11 +643,14 @@ static void win_openvr_render(void *data, gs_effect_t *effect)
 		}
 	}
 
-	// Backend 2: OpenVR / SteamVR Render Path
+	// Backend 2: OpenVR / SteamVR Render Path. Never in forced-OpenXR mode,
+	// where a leftover SteamVR mirror would otherwise show through whenever no
+	// OpenXR frame is available.
+	if (context->engine_mode == CaptureEngineMode::OpenXR_VDXR) {
+		return;
+	}
 	if (!context->initialized.load()) {
-		if (context->engine_mode != CaptureEngineMode::OpenXR_VDXR) {
-			win_openvr_init1(data);
-		}
+		win_openvr_init1(data);
 		if (!context->initialized.load()) {
 			return;
 		}

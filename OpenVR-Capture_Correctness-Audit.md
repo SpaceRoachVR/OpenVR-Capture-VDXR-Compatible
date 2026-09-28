@@ -25,6 +25,8 @@
 | B2: zoom / aspect / offsets applied to the OpenXR draw | ✅ done, verify with `tests/fake_producer` |
 | C1: runtime references released on SteamVR quit even after failed init; stale `VRSystem` never reused | ✅ done (code review only; needs a SteamVR quit/restart test) |
 | B3: per-eye textures + eye mask (IPC v3); one shared consumer per OBS process; hiding one source no longer disconnects others | ✅ done, covered by `tests/ipc_handshake_test` |
+| C2: failed mirror refresh clears `initialized` (no frozen frame, no per-frame forced retries) | ✅ done (code review only) |
+| C5: forced-OpenXR mode never draws the SteamVR mirror and releases OpenVR resources | ✅ done (code review only) |
 | Everything else | open |
 
 ---
