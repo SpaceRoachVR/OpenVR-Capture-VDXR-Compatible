@@ -30,6 +30,9 @@ using Clock = std::chrono::steady_clock;
 
 int main(int argc, char **argv)
 {
+	// Unbuffered, so status lines show up promptly when stdout is a pipe/file.
+	setvbuf(stdout, nullptr, _IONBF, 0);
+
 	const int fps = argc > 1 ? std::max(1, atoi(argv[1])) : 72;
 	const UINT width = argc > 2 ? static_cast<UINT>(std::max(32, atoi(argv[2]))) & ~1u : 3840;
 	const UINT height = argc > 3 ? static_cast<UINT>(std::max(16, atoi(argv[3]))) : 1920;

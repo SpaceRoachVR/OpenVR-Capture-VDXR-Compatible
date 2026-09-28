@@ -47,6 +47,7 @@ int main()
 	consumer->SetInterest(rightSrc, false, VREyeSelection::Right);
 	CHECK(HeaderView().hdr == nullptr);
 	CHECK(consumer->Initialize()); // what the Auto-mode producer probe does
+	CHECK(MappingGrantsAuthenticatedUsers()); // games can open it even if OBS runs as admin
 	{
 		HeaderView v;
 		CHECK(v.hdr != nullptr);

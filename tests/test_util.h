@@ -4,6 +4,7 @@
 
 #include "../shared/vr_ipc_types.h"
 #include <d3d11.h>
+#include <aclapi.h>
 #include <wrl/client.h>
 #include <cstdint>
 #include <cstdio>
@@ -49,6 +50,34 @@ struct HeaderView {
 	HeaderView(const HeaderView &) = delete;
 	HeaderView &operator=(const HeaderView &) = delete;
 };
+
+// True if the IPC mapping's DACL has an access-allowed ACE for Authenticated
+// Users, i.e. a non-elevated game can open it even when OBS runs elevated.
+inline bool MappingGrantsAuthenticatedUsers()
+{
+	HANDLE map = OpenFileMappingW(READ_CONTROL, FALSE, vrcapture::VR_IPC_SHARED_MEMORY_NAME);
+	if (!map) return false;
+	PACL dacl = nullptr;
+	PSECURITY_DESCRIPTOR sd = nullptr;
+	bool found = false;
+	if (GetSecurityInfo(map, SE_KERNEL_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl, nullptr, &sd) ==
+		    ERROR_SUCCESS &&
+	    dacl) {
+		BYTE sidBuf[SECURITY_MAX_SID_SIZE];
+		DWORD sidSize = sizeof(sidBuf);
+		CreateWellKnownSid(WinAuthenticatedUserSid, nullptr, sidBuf, &sidSize);
+		for (DWORD i = 0; i < dacl->AceCount && !found; ++i) {
+			ACE_HEADER *ace = nullptr;
+			if (GetAce(dacl, i, reinterpret_cast<void **>(&ace)) && ace->AceType == ACCESS_ALLOWED_ACE_TYPE) {
+				auto *allowed = reinterpret_cast<ACCESS_ALLOWED_ACE *>(ace);
+				found = EqualSid(&allowed->SidStart, sidBuf) != FALSE;
+			}
+		}
+	}
+	if (sd) LocalFree(sd);
+	CloseHandle(map);
+	return found;
+}
 
 // Test pattern: pixel (x, y) of the source image encodes its own coordinates.
 inline uint32_t PatternPixel(uint32_t x, uint32_t y)

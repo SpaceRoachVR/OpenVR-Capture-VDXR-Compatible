@@ -1,5 +1,6 @@
 #include "openxr_ipc_consumer.h"
 #include "obs_draw_util.h"
+#include <sddl.h>
 #include <algorithm>
 
 namespace vrcapture {
@@ -87,19 +88,34 @@ bool OpenXrIpcConsumer::InitializeLocked()
     }
     m_lastInitAttempt = now;
 
+    // OBS is commonly run as administrator (for game capture). An object
+    // created by an elevated process gets a default DACL that only admits
+    // Administrators and SYSTEM, so the non-elevated games that must open it
+    // would get ACCESS_DENIED. Grant Authenticated Users access explicitly.
+    SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, FALSE};
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)",
+                                                             SDDL_REVISION_1, &sd, nullptr)) {
+        sa.lpSecurityDescriptor = sd;
+    }
+
     // OBS owns the mapping (see vr_ipc_types.h): create it, or open it if a
     // still-attached game from an earlier OBS run already has it.
     HANDLE hMap = CreateFileMappingW(
         INVALID_HANDLE_VALUE,
-        nullptr,
+        sd ? &sa : nullptr,
         PAGE_READWRITE,
         0,
         sizeof(VRSharedFrameHeader),
         VR_IPC_SHARED_MEMORY_NAME);
+    const DWORD createError = GetLastError();
+    if (sd) {
+        LocalFree(sd);
+    }
     if (!hMap) {
         return false;
     }
-    const bool created = GetLastError() != ERROR_ALREADY_EXISTS;
+    const bool created = createError != ERROR_ALREADY_EXISTS;
 
     auto *header = reinterpret_cast<VRSharedFrameHeader *>(
         MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(VRSharedFrameHeader)));
