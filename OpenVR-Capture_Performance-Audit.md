@@ -1,5 +1,7 @@
 # OpenVR Capture — Performance Audit & Action Plan
 
+> **Superseded (2026-09-28).** This document describes an earlier ~370-line version of the plugin. Its items are implemented or replaced; see `OpenVR-Capture_Correctness-Audit.md` for the current audit and status. Kept for history.
+
 **Repo:** `OpenVR-Capture-master` (fork of OpenVR Capture input plugin for OBS)
 **Scope reviewed:** `plugins/win-openvr/win-openvr.cpp`, `plugins/win-openvr/CMakeLists.txt`
 **Focus:** performance-affecting issues (frame-time impact, init/teardown cost, responsiveness)

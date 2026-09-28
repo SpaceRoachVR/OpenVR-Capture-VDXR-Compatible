@@ -1,5 +1,7 @@
 # OpenVR Capture — Implementation Plan
 
+> **Superseded (2026-09-28).** This document describes an earlier ~370-line version of the plugin. Its items are implemented or replaced; see `OpenVR-Capture_Correctness-Audit.md` for the current audit and status. Kept for history.
+
 **Source audit:** `OpenVR-Capture_Performance-Audit.md`
 **Target file:** `plugins/win-openvr/win-openvr.cpp` (~370 lines, single TU)
 **Goal:** Resolve all 6 audit findings with minimal blast radius, in the audit's recommended order, while keeping every existing "already good" behavior intact (redundant-copy skip via `lastFrame`, Release build flags, `ComPtr` RAII).

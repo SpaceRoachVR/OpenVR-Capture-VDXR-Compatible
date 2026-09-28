@@ -31,7 +31,14 @@
 | C3 (reduced scope): no VR init from `video_render` or `show()`; idle retry checks for `vrserver.exe` before `VR_Init` | ✅ done; the one-time `VR_Init` connect still runs on the graphics thread (see note below) |
 | C6: `OBS_SOURCE_SRGB` + per-format sRGB/linear sampling for both engines | ✅ done (needs visual check vs headset) |
 | C7: lock order is now uniformly graphics → `context->mutex`; `update()` does no texture work | ✅ done as part of C4 |
-| Everything else | open |
+| A7: `xrDestroyInstance` hooked; per-instance function pointers cleared | ✅ done |
+| A6: D3D12 capture via D3D11On12 (Vulkan/OpenGL still unsupported, documented) | ✅ done, covered by `tests/d3d12_capture_test` |
+| A8: dead IPC names/events removed; version checked on both sides | ✅ done (across A3/B3) |
+| D3: README build/packaging/support matrix; old audit docs marked superseded | ✅ done |
+| D4–D6: CMake linking, locale, dead code | ✅ done |
+| CI: `.github/workflows/build.yml` builds everything and runs the tests | ✅ added (runs once the repo is pushed to GitHub) |
+| A5 remainder: copy in `xrReleaseSwapchainImage` instead of `xrEndFrame` | open; only if a headset test shows torn/garbage frames |
+| C3 remainder: one-time `VR_Init` on a worker thread | open; see C3 note |
 
 **C3 note:** fully moving `VR_Init` to a worker thread was deliberately not done. OpenVR's `VRSystem()` is used unguarded from the tick (event polling), so a worker calling `VR_Init`/`VR_Shutdown` concurrently needs a broader locking redesign that can't be verified without SteamVR. What remains is a single connect call when SteamVR starts; the recurring cost while SteamVR is down is gone.
 
