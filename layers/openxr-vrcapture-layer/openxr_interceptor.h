@@ -43,6 +43,7 @@ public:
     void SetInstance(XrInstance instance) { m_instance = instance; }
 
     // Intercepted OpenXR functions
+    XrResult xrDestroyInstance(XrInstance instance);
     XrResult xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInfo, XrSession *session);
     XrResult xrDestroySession(XrSession session);
     XrResult xrCreateSwapchain(XrSession session, const XrSwapchainCreateInfo *createInfo, XrSwapchain *swapchain);
@@ -66,7 +67,6 @@ private:
     XrInstance m_instance = nullptr;
 
     // Real function pointers, lazily resolved on first use via m_nextGetInstanceProcAddr
-    PFN_xrDestroyInstance m_pfnDestroyInstance = nullptr;
     PFN_xrCreateSession m_pfnCreateSession = nullptr;
     PFN_xrDestroySession m_pfnDestroySession = nullptr;
     PFN_xrCreateSwapchain m_pfnCreateSwapchain = nullptr;

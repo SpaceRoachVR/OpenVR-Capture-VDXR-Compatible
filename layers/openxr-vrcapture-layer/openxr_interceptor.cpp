@@ -31,6 +31,38 @@ OpenXRInterceptor &OpenXRInterceptor::Get()
     return *s_instance;
 }
 
+XrResult OpenXRInterceptor::xrDestroyInstance(XrInstance instance)
+{
+    PFN_xrDestroyInstance destroyInstance = nullptr;
+    ResolveProc(m_nextGetInstanceProcAddr, instance, "xrDestroyInstance", destroyInstance);
+
+    // Normally xrDestroySession already did this; an app may destroy the
+    // instance with a session still alive.
+    m_ipc.StopWorker();
+    m_ipc.Shutdown();
+    {
+        std::lock_guard<std::mutex> lock(m_swapchainMutex);
+        m_swapchains.clear();
+        m_d3d11Context.Reset();
+        m_d3d11Device.Reset();
+    }
+
+    // Function pointers are only valid for the instance they were resolved
+    // from. Forget them so a later instance in the same process re-resolves
+    // against itself instead of calling into a destroyed one.
+    m_instance = nullptr;
+    m_pfnCreateSession = nullptr;
+    m_pfnDestroySession = nullptr;
+    m_pfnCreateSwapchain = nullptr;
+    m_pfnDestroySwapchain = nullptr;
+    m_pfnEnumerateSwapchainImages = nullptr;
+    m_pfnAcquireSwapchainImage = nullptr;
+    m_pfnReleaseSwapchainImage = nullptr;
+    m_pfnEndFrame = nullptr;
+
+    return destroyInstance ? destroyInstance(instance) : XR_ERROR_FUNCTION_UNSUPPORTED;
+}
+
 XrResult OpenXRInterceptor::xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInfo, XrSession *session)
 {
     if (m_instance == nullptr) {
@@ -312,6 +344,11 @@ PFN_xrVoidFunction OpenXRInterceptor::GetHookedProcAddr(const char *name)
 {
     if (!name) return nullptr;
 
+    if (strcmp(name, "xrDestroyInstance") == 0) {
+        return reinterpret_cast<PFN_xrVoidFunction>(+[](XrInstance instance) {
+            return OpenXRInterceptor::Get().xrDestroyInstance(instance);
+        });
+    }
     if (strcmp(name, "xrCreateSession") == 0) {
         return reinterpret_cast<PFN_xrVoidFunction>(+[](XrInstance instance, const XrSessionCreateInfo *createInfo, XrSession *session) {
             return OpenXRInterceptor::Get().xrCreateSession(instance, createInfo, session);
