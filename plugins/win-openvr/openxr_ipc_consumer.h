@@ -32,12 +32,15 @@ public:
     void Render(gs_effect_t *effect);
 
 private:
+    // Callers of the *Locked / DestroyTexture helpers must hold m_mutex.
+    bool InitializeLocked();
     void DestroyTexture();
 
     std::mutex m_mutex;
 
     HANDLE m_hMapFile = nullptr;
     VRSharedFrameHeader *m_sharedHeader = nullptr;
+    uint64_t m_lastInitAttempt = 0;
 
     gs_texture_t *m_obsTexture = nullptr;
     ComPtr<IDXGIKeyedMutex> m_obsKeyedMutex;

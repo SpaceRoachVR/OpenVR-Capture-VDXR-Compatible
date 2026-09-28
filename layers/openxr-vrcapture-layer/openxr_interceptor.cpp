@@ -194,7 +194,9 @@ XrResult OpenXRInterceptor::xrEndFrame(XrSession session, const XrFrameEndInfo *
 {
     ResolveProc(m_nextGetInstanceProcAddr, m_instance, "xrEndFrame", m_pfnEndFrame);
 
-    if (frameEndInfo && m_d3d11Device && m_d3d11Context && m_ipc.IsObsConnected()) {
+    // Only D3D11 sessions are capturable, so only those attach to OBS's
+    // mapping; TryAttach is throttled and costs nothing once attached.
+    if (frameEndInfo && m_d3d11Device && m_d3d11Context && m_ipc.TryAttach() && m_ipc.IsObsConnected()) {
         for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
             if (!frameEndInfo->layers[i]) continue;
 

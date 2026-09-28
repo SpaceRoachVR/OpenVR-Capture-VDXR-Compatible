@@ -8,6 +8,21 @@
 
 ---
 
+## Status
+
+| Item | State |
+|---|---|
+| Phase 0: git baseline, both targets build (MSVC + Ninja, OBS SDK 32.2.1) | ✅ done |
+| A1: official OpenXR headers (OpenXR-SDK release-1.1.63) + loader struct validation | ✅ done |
+| A2 + D1 + D2: manifest `disable_environment`, manifest emitted next to DLL, installer | ✅ done |
+| A3: OBS owns the mapping, layer attaches at ≤1 Hz, IPC v2 version check | ✅ done, covered by `tests/ipc_handshake_test` |
+| (new) consumer re-locked its own non-recursive mutex in `UpdateTexture` → `Initialize` | ✅ fixed with A3 |
+| B4 / B5: consumer mapping retry throttle, locked header access | ✅ done with A3 |
+| SteamVR-only sources no longer touch the OpenXR IPC (part of B3) | ✅ done with A3 |
+| Everything else | open |
+
+---
+
 ## TL;DR
 
 The **SteamVR/OpenVR path is mostly sound**. It has one real lifecycle bug (a zombie `VRSystem` after SteamVR quits) and a few smaller issues.

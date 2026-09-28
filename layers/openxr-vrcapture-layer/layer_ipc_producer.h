@@ -17,6 +17,11 @@ public:
     LayerIpcProducer();
     ~LayerIpcProducer();
 
+    // Opens OBS's shared mapping if it exists. Cheap to call every frame: it
+    // retries the OpenFileMappingW at most once per kAttachRetryMs.
+    bool TryAttach();
+
+    // Creates/resizes the shared texture. Requires a prior successful TryAttach().
     bool Initialize(ID3D11Device *device, uint32_t width, uint32_t height, DXGI_FORMAT format, bool is_d3d12 = false);
     void Shutdown();
 
@@ -26,7 +31,7 @@ public:
     // host application on exit.
     void StopWorker();
 
-    // Non-blocking: hands the (possibly blocking) CreateFileMappingW/CreateTexture2D
+    // Non-blocking: hands the (possibly blocking) CreateTexture2D
     // work to a background worker thread so callers on latency-sensitive paths
     // (e.g. xrEndFrame) never stall on it. Safe to call every frame; only the
     // most recent request is honored if several arrive before the worker catches up.
@@ -58,9 +63,11 @@ private:
     mutable std::mutex m_mutex;
 
     // Shared memory IPC
+    static constexpr uint64_t kAttachRetryMs = 1000;
+
     HANDLE m_hMapFile = nullptr;
     VRSharedFrameHeader *m_sharedHeader = nullptr;
-    HANDLE m_hFrameEvent = nullptr;
+    uint64_t m_lastAttachAttempt = 0;
 
     // D3D11 shared resources
     ComPtr<ID3D11Device> m_device;

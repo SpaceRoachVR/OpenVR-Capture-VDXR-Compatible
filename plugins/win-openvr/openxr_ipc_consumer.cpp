@@ -39,40 +39,62 @@ OpenXrIpcConsumer::~OpenXrIpcConsumer()
 bool OpenXrIpcConsumer::Initialize()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
+    return InitializeLocked();
+}
 
+bool OpenXrIpcConsumer::InitializeLocked()
+{
     if (m_sharedHeader) {
         return true;
     }
 
-    m_hMapFile = OpenFileMappingW(
-        FILE_MAP_ALL_ACCESS,
-        FALSE,
+    // Only reached again if a previous attempt failed (e.g. an incompatible
+    // layer version holds the mapping); don't retry on every video tick.
+    const uint64_t now = GetTickCount64();
+    if (m_lastInitAttempt != 0 && now - m_lastInitAttempt < 1000) {
+        return false;
+    }
+    m_lastInitAttempt = now;
+
+    // OBS owns the mapping (see vr_ipc_types.h): create it, or open it if
+    // another source in this process -- or a still-attached game from an
+    // earlier OBS run -- already has it.
+    HANDLE hMap = CreateFileMappingW(
+        INVALID_HANDLE_VALUE,
+        nullptr,
+        PAGE_READWRITE,
+        0,
+        sizeof(VRSharedFrameHeader),
         VR_IPC_SHARED_MEMORY_NAME);
+    if (!hMap) {
+        return false;
+    }
+    const bool created = GetLastError() != ERROR_ALREADY_EXISTS;
 
-    if (!m_hMapFile) {
+    auto *header = reinterpret_cast<VRSharedFrameHeader *>(
+        MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(VRSharedFrameHeader)));
+    if (!header) {
+        CloseHandle(hMap);
         return false;
     }
 
-    m_sharedHeader = reinterpret_cast<VRSharedFrameHeader *>(
-        MapViewOfFile(m_hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(VRSharedFrameHeader)));
-
-    if (!m_sharedHeader) {
-        CloseHandle(m_hMapFile);
-        m_hMapFile = nullptr;
+    if (created) {
+        // Fresh pages are zeroed. Fill in the identity last so a layer that
+        // opens the mapping mid-initialization rejects it and retries.
+        header->active_backend = VRBackendType::Inactive;
+        header->requested_eye = static_cast<uint32_t>(VREyeSelection::Right);
+        header->version = VR_IPC_VERSION;
+        MemoryBarrier();
+        header->magic = VR_IPC_MAGIC;
+    } else if (header->magic != VR_IPC_MAGIC || header->version != VR_IPC_VERSION) {
+        // Created by an incompatible plugin/layer build; don't interpret it.
+        UnmapViewOfFile(header);
+        CloseHandle(hMap);
         return false;
     }
 
-    if (m_sharedHeader->magic != VR_IPC_MAGIC) {
-        UnmapViewOfFile(m_sharedHeader);
-        m_sharedHeader = nullptr;
-        CloseHandle(m_hMapFile);
-        m_hMapFile = nullptr;
-        return false;
-    }
-
-    m_sharedHeader->obs_connected = 1;
-    m_sharedHeader->last_consumer_heartbeat = GetTickCount64();
-
+    m_hMapFile = hMap;
+    m_sharedHeader = header;
     return true;
 }
 
@@ -106,28 +128,25 @@ void OpenXrIpcConsumer::Shutdown()
     m_currentSharedHandle = 0;
     m_width = 0;
     m_height = 0;
+    m_lastInitAttempt = 0;
 }
 
 bool OpenXrIpcConsumer::IsProducerActive()
 {
-    if (!m_sharedHeader) {
-        Initialize();
-    }
+    std::lock_guard<std::mutex> lock(m_mutex);
 
-    if (!m_sharedHeader) {
+    if (!InitializeLocked()) {
         return false;
     }
 
     uint64_t now = GetTickCount64();
-    if (m_sharedHeader->magic == VR_IPC_MAGIC &&
-        m_sharedHeader->active_backend == VRBackendType::OpenXR_VDXR &&
+    if (m_sharedHeader->active_backend == VRBackendType::OpenXR_VDXR &&
         (now - m_sharedHeader->last_producer_heartbeat < 2000)) {
         return true;
     }
 
     // Producer is inactive or closed: release texture to prevent rendering a dead handle
     if (m_obsTexture) {
-        std::lock_guard<std::mutex> lock(m_mutex);
         DestroyTexture();
         m_currentSharedHandle = 0;
         m_width = 0;
@@ -139,11 +158,9 @@ bool OpenXrIpcConsumer::IsProducerActive()
 
 void OpenXrIpcConsumer::SetConnected(bool connected)
 {
-    if (!m_sharedHeader) {
-        Initialize();
-    }
+    std::lock_guard<std::mutex> lock(m_mutex);
 
-    if (m_sharedHeader) {
+    if (InitializeLocked()) {
         m_sharedHeader->obs_connected = connected ? 1 : 0;
         m_sharedHeader->last_consumer_heartbeat = GetTickCount64();
     }
@@ -153,11 +170,8 @@ bool OpenXrIpcConsumer::UpdateTexture(VREyeSelection eye)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    if (!m_sharedHeader) {
-        Initialize();
-    }
-
-    if (!m_sharedHeader) {
+    // m_mutex is not recursive: must call the Locked variant here.
+    if (!InitializeLocked()) {
         return false;
     }
 

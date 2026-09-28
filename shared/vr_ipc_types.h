@@ -10,17 +10,20 @@ namespace vrcapture {
 
 // Magic identifier for SpaceRoachVR / VR Capture IPC ("VRCP" = 0x56524350)
 static constexpr uint32_t VR_IPC_MAGIC = 0x56524350;
-static constexpr uint32_t VR_IPC_VERSION = 1;
+// v2: the OBS consumer creates and owns the mapping; the layer only opens it.
+static constexpr uint32_t VR_IPC_VERSION = 2;
 
 // Upper bound on texture_width/texture_height accepted from the shared header.
 // The header is written by another process, so dimensions must be sanity-checked
 // before being used to size/allocate anything on the consumer side.
 static constexpr uint32_t VR_IPC_MAX_TEXTURE_DIM = 16384;
 
-// Shared memory and synchronization names
+// Shared memory name. Ownership: the OBS plugin creates the mapping (and fills
+// in magic/version) when an OpenXR-capable source exists. The OpenXR layer only
+// ever opens it, polling at a low rate, so OpenXR apps pay nothing while OBS
+// isn't capturing. magic is written last by the creator; a reader that sees a
+// valid magic + matching version can trust the rest of the layout.
 static const wchar_t *const VR_IPC_SHARED_MEMORY_NAME = L"Local\\SpaceRoachVR_Capture_IPC";
-static const wchar_t *const VR_IPC_MUTEX_NAME = L"Local\\SpaceRoachVR_Capture_Mutex";
-static const wchar_t *const VR_IPC_FRAME_EVENT_NAME = L"Local\\SpaceRoachVR_Capture_FrameEvent";
 
 enum class VRBackendType : uint32_t {
     Inactive = 0,

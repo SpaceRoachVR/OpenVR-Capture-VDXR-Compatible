@@ -140,6 +140,13 @@ struct win_openvr {
 };
 
 // Helper to destroy OBS texture safely inside graphics context
+// Sources locked to SteamVR never touch the OpenXR IPC, so they don't create
+// the shared mapping or advertise OBS as a consumer to OpenXR games.
+static bool uses_openxr_ipc(const win_openvr *context)
+{
+	return context->openxr_consumer && context->engine_mode != CaptureEngineMode::OpenVR_SteamVR;
+}
+
 static void destroy_obs_texture(gs_texture_t **texture) {
 	if (texture && *texture) {
 		obs_enter_graphics();
@@ -521,7 +528,7 @@ static void win_openvr_show(void *data)
 	if (!context) return;
 	context->active.store(true);
 
-	if (context->openxr_consumer) {
+	if (uses_openxr_ipc(context)) {
 		context->openxr_consumer->SetConnected(true);
 	}
 
@@ -536,7 +543,7 @@ static void win_openvr_hide(void *data)
 	if (!context) return;
 	context->active.store(false); // pause copy/render only
 
-	if (context->openxr_consumer) {
+	if (uses_openxr_ipc(context)) {
 		context->openxr_consumer->SetConnected(false);
 	}
 }
@@ -664,7 +671,7 @@ static void win_openvr_tick(void *data, float seconds)
 	context->active.store(obs_source_showing(context->source));
 
 	// Dual-Engine Resolution and Auto-Detection
-	bool openxr_active = context->openxr_consumer && context->openxr_consumer->IsProducerActive();
+	bool openxr_active = uses_openxr_ipc(context) && context->openxr_consumer->IsProducerActive();
 
 	if (context->engine_mode == CaptureEngineMode::OpenXR_VDXR) {
 		context->active_engine = CaptureEngineMode::OpenXR_VDXR;

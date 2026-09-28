@@ -86,61 +86,68 @@ void LayerIpcProducer::RequestAsyncInitialize(ID3D11Device *device, uint32_t wid
     m_initCv.notify_all();
 }
 
+bool LayerIpcProducer::TryAttach()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (m_sharedHeader) {
+        return true;
+    }
+
+    // Called from xrEndFrame every frame; only hit the kernel about once a
+    // second while OBS isn't running (the common case for most OpenXR apps).
+    const uint64_t now = GetTickCount64();
+    if (m_lastAttachAttempt != 0 && now - m_lastAttachAttempt < kAttachRetryMs) {
+        return false;
+    }
+    m_lastAttachAttempt = now;
+
+    // OBS owns the mapping; never create it here (see vr_ipc_types.h).
+    HANDLE hMap = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, VR_IPC_SHARED_MEMORY_NAME);
+    if (!hMap) {
+        return false;
+    }
+
+    auto *header = reinterpret_cast<VRSharedFrameHeader *>(
+        MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(VRSharedFrameHeader)));
+    if (!header) {
+        CloseHandle(hMap);
+        return false;
+    }
+
+    if (header->magic != VR_IPC_MAGIC || header->version != VR_IPC_VERSION) {
+        // Not initialized yet, or a plugin/layer version mismatch.
+        UnmapViewOfFile(header);
+        CloseHandle(hMap);
+        return false;
+    }
+
+    m_hMapFile = hMap;
+    m_sharedHeader = header;
+
+    m_sharedHeader->shared_handle = 0;
+    m_sharedHeader->texture_width = 0;
+    m_sharedHeader->texture_height = 0;
+    m_sharedHeader->is_d3d12 = m_isD3D12 ? 1 : 0;
+    m_sharedHeader->last_producer_heartbeat = GetTickCount64();
+    m_sharedHeader->active_backend = VRBackendType::OpenXR_VDXR;
+
+    return true;
+}
+
 bool LayerIpcProducer::Initialize(ID3D11Device *device, uint32_t width, uint32_t height, DXGI_FORMAT format, bool is_d3d12)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    if (!device || width == 0 || height == 0) {
+    if (!device || width == 0 || height == 0 || !m_sharedHeader) {
         return false;
     }
 
     m_device = device;
     m_isD3D12 = is_d3d12;
+    m_sharedHeader->is_d3d12 = is_d3d12 ? 1 : 0;
 
-    // 1. Create or open Named Shared Memory
-    if (!m_hMapFile) {
-        m_hMapFile = CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            nullptr,
-            PAGE_READWRITE,
-            0,
-            sizeof(VRSharedFrameHeader),
-            VR_IPC_SHARED_MEMORY_NAME);
-
-        if (!m_hMapFile) {
-            return false;
-        }
-
-        m_sharedHeader = reinterpret_cast<VRSharedFrameHeader *>(
-            MapViewOfFile(m_hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(VRSharedFrameHeader)));
-
-        if (!m_sharedHeader) {
-            CloseHandle(m_hMapFile);
-            m_hMapFile = nullptr;
-            return false;
-        }
-
-        // Initialize header
-        m_sharedHeader->magic = VR_IPC_MAGIC;
-        m_sharedHeader->version = VR_IPC_VERSION;
-        m_sharedHeader->seq = 0;
-        m_sharedHeader->active_backend = VRBackendType::OpenXR_VDXR;
-        m_sharedHeader->is_d3d12 = is_d3d12 ? 1 : 0;
-        m_sharedHeader->frame_index = 0;
-        m_sharedHeader->last_producer_heartbeat = GetTickCount64();
-    }
-
-    // 2. Create Event for frame synchronization notification
-    if (!m_hFrameEvent) {
-        m_hFrameEvent = CreateEventW(nullptr, FALSE, FALSE, VR_IPC_FRAME_EVENT_NAME);
-    }
-
-    // 3. Create or update shared texture
-    if (!CreateSharedTexture(device, width, height, format)) {
-        return false;
-    }
-
-    return true;
+    return CreateSharedTexture(device, width, height, format);
 }
 
 bool LayerIpcProducer::CreateSharedTexture(ID3D11Device *device, uint32_t width, uint32_t height, DXGI_FORMAT format)
@@ -196,10 +203,8 @@ void LayerIpcProducer::Shutdown()
         m_hMapFile = nullptr;
     }
 
-    if (m_hFrameEvent) {
-        CloseHandle(m_hFrameEvent);
-        m_hFrameEvent = nullptr;
-    }
+    // Let the next session re-attach immediately rather than after the throttle.
+    m_lastAttachAttempt = 0;
 }
 
 bool LayerIpcProducer::IsObsConnected()
@@ -290,10 +295,6 @@ void LayerIpcProducer::EndFrameCopy(int64_t display_time_ns, const float fov[4],
         }
 
         InterlockedIncrement(&m_sharedHeader->seq); // back to even: stable
-    }
-
-    if (m_hFrameEvent) {
-        SetEvent(m_hFrameEvent);
     }
 }
 
