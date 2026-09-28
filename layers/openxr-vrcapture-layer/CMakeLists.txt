@@ -35,9 +35,13 @@ if(MSVC)
     set_property(TARGET openxr-vrcapture-layer APPEND_STRING PROPERTY LINK_FLAGS_RELEASE " /LTCG /OPT:REF /OPT:ICF")
 endif()
 
-# Configure the OpenXR layer manifest
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/layer_manifest.json.in
-    ${CMAKE_CURRENT_BINARY_DIR}/openxr-vrcapture-layer.json
-    @ONLY
+# Emit the manifest next to the DLL for every configuration, so its relative
+# library_path ("./openxr-vrcapture-layer.dll") resolves. With multi-config
+# generators the DLL lands in e.g. build/Release/, not the binary dir root.
+file(GENERATE
+    OUTPUT "$<TARGET_FILE_DIR:openxr-vrcapture-layer>/openxr-vrcapture-layer.json"
+    INPUT "${CMAKE_CURRENT_SOURCE_DIR}/layer_manifest.json.in"
 )
+
+install(TARGETS openxr-vrcapture-layer RUNTIME DESTINATION .)
+install(FILES "$<TARGET_FILE_DIR:openxr-vrcapture-layer>/openxr-vrcapture-layer.json" DESTINATION .)

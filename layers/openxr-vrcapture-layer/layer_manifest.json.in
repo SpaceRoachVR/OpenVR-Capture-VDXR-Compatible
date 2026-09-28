@@ -7,6 +7,7 @@
         "api_version": "1.0",
         "implementation_version": "1",
         "description": "SpaceRoachVR OpenXR & VDXR Capture Layer for OBS Studio",
+        "disable_environment": "DISABLE_XR_APILAYER_SPACEROACH_VR_CAPTURE",
         "functions": {
             "xrNegotiateLoaderApiLayerInterface": "xrNegotiateLoaderApiLayerInterface"
         }
