@@ -58,6 +58,9 @@ static std::mutex s_openvr_init_mutex;
 // differ, so ALL sources drop their now-dangling mirror textures -- not just
 // whichever one happened to poll the quit event off the queue.
 static std::atomic<uint64_t> s_openvr_generation{0};
+// s_openvr_generation at the time the current VRSystem() was created.
+// Guarded by s_openvr_init_mutex.
+static uint64_t s_vr_system_generation = 0;
 // Bumped whenever a VR game starts, stops, or changes resolution in SteamVR.
 // Sources compare this and re-query their mirror texture from the compositor.
 static std::atomic<uint64_t> s_openvr_mirror_generation{0};
@@ -126,9 +129,10 @@ struct win_openvr {
 
 	std::atomic<bool> initialized{false};
 	std::atomic<bool> active{true};
-	bool vr_initialized = false;
+	// True while this source holds one s_openvr_instances reference.
+	std::atomic<bool> vr_initialized{false};
 
-	// s_openvr_generation value this source last initialized under
+	// s_openvr_generation of the runtime this source's reference belongs to
 	uint64_t init_generation = 0;
 	uint64_t mirror_generation = 0;
 
@@ -297,6 +301,7 @@ static void win_openvr_init(void *data, bool forced)
 
 	{
 		std::lock_guard<std::mutex> global_lock(s_openvr_init_mutex);
+		const uint64_t generation = s_openvr_generation.load();
 		if (vr::VRSystem() == nullptr) {
 			vr::EVRInitError err = vr::VRInitError_None;
 			vr::VR_Init(&err, vr::VRApplication_Background);
@@ -304,9 +309,20 @@ static void win_openvr_init(void *data, bool forced)
 				on_failure();
 				return;
 			}
+			s_vr_system_generation = generation;
+		} else if (s_vr_system_generation != generation) {
+			// VRSystem() is left over from a SteamVR that has since quit: some
+			// source still holds a reference and hasn't torn down yet (it will
+			// on its next tick). Joining it would leak a reference to a dead
+			// runtime and block VR_Shutdown forever, so retry later instead.
+			on_failure();
+			return;
 		}
 		if (!context->vr_initialized) {
 			context->vr_initialized = true;
+			// Tie this reference to the runtime it was taken on, so tick()
+			// releases it when SteamVR quits even if the rest of init failed.
+			context->init_generation = generation;
 			s_openvr_instances++;
 		}
 	}
@@ -364,7 +380,6 @@ static void win_openvr_init(void *data, bool forced)
 	}
 
 	context->lastFrame = 0;
-	context->init_generation = s_openvr_generation.load();
 	context->mirror_generation = s_openvr_mirror_generation.load();
 	context->initialized.store(true);
 	context->init_inprog.store(false);
@@ -744,7 +759,11 @@ static void win_openvr_tick(void *data, float seconds)
 	// Tear down if SteamVR quit under us (either we saw the event above, or
 	// another source did). Must happen before any further use of the mirror
 	// texture -- it belongs to a compositor that no longer exists.
-	if (context->initialized.load() && context->init_generation != s_openvr_generation.load()) {
+	// Keyed on vr_initialized, not initialized: a source whose VR_Init
+	// succeeded but whose mirror setup failed still holds a runtime reference,
+	// and if it never released it VR_Shutdown would never run and the plugin
+	// could not reconnect to a restarted SteamVR without restarting OBS.
+	if (context->vr_initialized.load() && context->init_generation != s_openvr_generation.load()) {
 		win_openvr_deinit(data);
 	} else if (context->initialized.load() && context->mirror_generation != s_openvr_mirror_generation.load()) {
 		// Game closed or switched: refresh the mirror texture cleanly without tearing down VRSystem
