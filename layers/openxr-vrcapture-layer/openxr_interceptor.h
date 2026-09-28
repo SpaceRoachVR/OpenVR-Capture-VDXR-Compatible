@@ -5,10 +5,12 @@
 #include <windows.h>
 #include <unknwn.h>
 #include <d3d11.h>
+#include <d3d12.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/openxr_loader_negotiation.h>
 #include "layer_ipc_producer.h"
+#include "d3d12_interop.h"
 #include <unordered_map>
 #include <vector>
 #include <mutex>
@@ -24,6 +26,7 @@ struct SwapchainInfo {
     uint32_t arraySize = 1;
     uint32_t mipCount = 1;
     uint32_t sampleCount = 1;
+    uint64_t usageFlags = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     std::vector<ComPtr<ID3D11Texture2D>> d3d11_textures;
 
@@ -76,10 +79,16 @@ private:
     PFN_xrReleaseSwapchainImage m_pfnReleaseSwapchainImage = nullptr;
     PFN_xrEndFrame m_pfnEndFrame = nullptr;
 
-    // D3D11 Graphics State
+    // D3D11 Graphics State. For D3D12 sessions these are the D3D11On12
+    // device/context from m_d3d12, so the capture path is the same for both.
     ComPtr<ID3D11Device> m_d3d11Device;
     ComPtr<ID3D11DeviceContext> m_d3d11Context;
     bool m_isD3D12 = false;
+    D3D12Interop m_d3d12;
+
+    // Caller holds m_swapchainMutex. Drops swapchain state and the graphics
+    // objects (wrapped D3D12 images before the D3D11On12 device).
+    void ResetGraphicsLocked();
 
     // Swapchain registry
     std::mutex m_swapchainMutex;

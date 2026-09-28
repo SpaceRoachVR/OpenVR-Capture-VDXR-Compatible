@@ -25,8 +25,27 @@ target_link_directories(ipc_handshake_test PRIVATE ${ROOT}/deps/obs)
 target_link_libraries(ipc_handshake_test PRIVATE obs d3d11 dxgi delayimp)
 target_link_options(ipc_handshake_test PRIVATE /DELAYLOAD:obs.dll)
 
+add_executable(d3d12_capture_test
+	d3d12_capture_test.cpp
+	${ROOT}/layers/openxr-vrcapture-layer/d3d12_interop.cpp
+	${ROOT}/layers/openxr-vrcapture-layer/layer_ipc_producer.cpp
+	${ROOT}/plugins/win-openvr/openxr_ipc_consumer.cpp
+)
+target_compile_features(d3d12_capture_test PRIVATE cxx_std_17)
+target_compile_definitions(d3d12_capture_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(d3d12_capture_test PRIVATE
+	${ROOT}/layers/openxr-vrcapture-layer
+	${ROOT}/plugins/win-openvr
+	${ROOT}/shared
+	${ROOT}/deps/obs/include
+)
+target_link_directories(d3d12_capture_test PRIVATE ${ROOT}/deps/obs)
+target_link_libraries(d3d12_capture_test PRIVATE obs d3d11 d3d12 dxgi delayimp)
+target_link_options(d3d12_capture_test PRIVATE /DELAYLOAD:obs.dll)
+
 enable_testing()
 add_test(NAME ipc_handshake COMMAND ipc_handshake_test)
+add_test(NAME d3d12_capture COMMAND d3d12_capture_test)
 
 # Manual tool, not a ctest: impersonates an OpenXR game for testing OBS
 # without a headset. See the header comment in fake_producer.cpp.

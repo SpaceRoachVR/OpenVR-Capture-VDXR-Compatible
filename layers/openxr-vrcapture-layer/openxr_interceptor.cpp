@@ -31,6 +31,15 @@ OpenXRInterceptor &OpenXRInterceptor::Get()
     return *s_instance;
 }
 
+void OpenXRInterceptor::ResetGraphicsLocked()
+{
+    m_swapchains.clear();
+    m_d3d11Context.Reset();
+    m_d3d11Device.Reset();
+    m_d3d12.Reset();
+    m_isD3D12 = false;
+}
+
 XrResult OpenXRInterceptor::xrDestroyInstance(XrInstance instance)
 {
     PFN_xrDestroyInstance destroyInstance = nullptr;
@@ -42,9 +51,7 @@ XrResult OpenXRInterceptor::xrDestroyInstance(XrInstance instance)
     m_ipc.Shutdown();
     {
         std::lock_guard<std::mutex> lock(m_swapchainMutex);
-        m_swapchains.clear();
-        m_d3d11Context.Reset();
-        m_d3d11Device.Reset();
+        ResetGraphicsLocked();
     }
 
     // Function pointers are only valid for the instance they were resolved
@@ -70,31 +77,45 @@ XrResult OpenXRInterceptor::xrCreateSession(XrInstance instance, const XrSession
     }
     ResolveProc(m_nextGetInstanceProcAddr, instance, "xrCreateSession", m_pfnCreateSession);
 
-    if (createInfo && createInfo->next) {
-        const XrBaseInStructure *next = reinterpret_cast<const XrBaseInStructure *>(createInfo->next);
-        // Bound the walk: a malformed or accidentally-cyclic extension chain
-        // must not be able to hang the app in an infinite loop here.
-        constexpr int kMaxChainLength = 64;
-        int guard = 0;
-        while (next && guard++ < kMaxChainLength) {
-            if (next->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
-                const auto *d3d11 = reinterpret_cast<const XrGraphicsBindingD3D11KHR *>(next);
-                if (d3d11 && d3d11->device) {
-                    m_d3d11Device = d3d11->device;
-                    m_d3d11Device->GetImmediateContext(m_d3d11Context.ReleaseAndGetAddressOf());
-                    m_isD3D12 = false;
-                }
-            } else if (next->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
-                m_isD3D12 = true;
-            }
-            next = next->next;
+    if (!m_pfnCreateSession) {
+        return XR_ERROR_FUNCTION_UNSUPPORTED;
+    }
+    const XrResult result = m_pfnCreateSession(instance, createInfo, session);
+    if (XR_FAILED(result) || !createInfo) {
+        return result;
+    }
+
+    // Record the graphics binding of the session that was actually created.
+    const XrGraphicsBindingD3D11KHR *d3d11 = nullptr;
+    const XrGraphicsBindingD3D12KHR *d3d12 = nullptr;
+    const XrBaseInStructure *next = reinterpret_cast<const XrBaseInStructure *>(createInfo->next);
+    // Bound the walk: a malformed or accidentally-cyclic extension chain
+    // must not be able to hang the app in an infinite loop here.
+    constexpr int kMaxChainLength = 64;
+    for (int guard = 0; next && guard < kMaxChainLength; ++guard, next = next->next) {
+        if (next->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
+            d3d11 = reinterpret_cast<const XrGraphicsBindingD3D11KHR *>(next);
+        } else if (next->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
+            d3d12 = reinterpret_cast<const XrGraphicsBindingD3D12KHR *>(next);
         }
     }
 
-    if (m_pfnCreateSession) {
-        return m_pfnCreateSession(instance, createInfo, session);
+    std::lock_guard<std::mutex> lock(m_swapchainMutex);
+    ResetGraphicsLocked();
+    if (d3d11 && d3d11->device) {
+        m_d3d11Device = d3d11->device;
+        m_d3d11Device->GetImmediateContext(m_d3d11Context.GetAddressOf());
+    } else if (d3d12 && d3d12->device && d3d12->queue) {
+        // D3D12: layer a D3D11 device over the app's device and queue and
+        // capture through it (see D3D12Interop). Other graphics APIs
+        // (Vulkan, OpenGL) are not captured.
+        if (m_d3d12.Initialize(d3d12->device, d3d12->queue)) {
+            m_d3d11Device = m_d3d12.Device();
+            m_d3d11Context = m_d3d12.Context();
+            m_isD3D12 = true;
+        }
     }
-    return XR_ERROR_FUNCTION_UNSUPPORTED;
+    return result;
 }
 
 XrResult OpenXRInterceptor::xrDestroySession(XrSession session)
@@ -106,10 +127,10 @@ XrResult OpenXRInterceptor::xrDestroySession(XrSession session)
     m_ipc.StopWorker();
     m_ipc.Shutdown();
 
-    std::lock_guard<std::mutex> lock(m_swapchainMutex);
-    m_swapchains.clear();
-    m_d3d11Context.Reset();
-    m_d3d11Device.Reset();
+    {
+        std::lock_guard<std::mutex> lock(m_swapchainMutex);
+        ResetGraphicsLocked();
+    }
 
     if (m_pfnDestroySession) {
         return m_pfnDestroySession(session);
@@ -132,6 +153,7 @@ XrResult OpenXRInterceptor::xrCreateSwapchain(XrSession session, const XrSwapcha
         info.mipCount = createInfo->mipCount > 0 ? createInfo->mipCount : 1;
         info.sampleCount = createInfo->sampleCount;
         info.format = static_cast<DXGI_FORMAT>(createInfo->format);
+        info.usageFlags = createInfo->usageFlags;
         m_swapchains[*swapchain] = info;
     }
 
@@ -176,6 +198,17 @@ XrResult OpenXRInterceptor::xrEnumerateSwapchainImages(XrSwapchain swapchain, ui
                 it->second.d3d11_textures.resize(count);
                 for (uint32_t i = 0; i < count; ++i) {
                     it->second.d3d11_textures[i] = d3d11Images[i].texture;
+                }
+            } else if (images->type == XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR && m_d3d12.IsValid() &&
+                       (it->second.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT)) {
+                // Only color swapchains can be projection views; wrapping
+                // assumes their RENDER_TARGET hand-back state.
+                auto *d3d12Images = reinterpret_cast<XrSwapchainImageD3D12KHR *>(images);
+                uint32_t count = imageCountOutput ? *imageCountOutput : imageCapacityInput;
+                count = (std::min)(count, imageCapacityInput);
+                it->second.d3d11_textures.resize(count);
+                for (uint32_t i = 0; i < count; ++i) {
+                    it->second.d3d11_textures[i] = m_d3d12.Wrap(d3d12Images[i].texture);
                 }
             }
         }
@@ -296,8 +329,16 @@ bool OpenXRInterceptor::CaptureView(VREyeSelection eye, const XrCompositionLayer
                                   view.pose.orientation.w};
     const float position[3] = {view.pose.position.x, view.pose.position.y, view.pose.position.z};
 
-    return m_ipc.CopyEye(eye, m_d3d11Context.Get(), srcTexRef.Get(), D3D11CalcSubresource(0, arrayIndex, swapMips),
-                         box, fov, orientation, position);
+    // Wrapped D3D12 images must be acquired around any D3D11 use.
+    if (m_isD3D12) {
+        m_d3d12.Acquire(srcTexRef.Get());
+    }
+    const bool copied = m_ipc.CopyEye(eye, m_d3d11Context.Get(), srcTexRef.Get(),
+                                      D3D11CalcSubresource(0, arrayIndex, swapMips), box, fov, orientation, position);
+    if (m_isD3D12) {
+        m_d3d12.Release(srcTexRef.Get());
+    }
+    return copied;
 }
 
 XrResult OpenXRInterceptor::xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
@@ -326,6 +367,11 @@ XrResult OpenXRInterceptor::xrEndFrame(XrSession session, const XrFrameEndInfo *
                         anyCopied |= CaptureView(eye, proj->views[viewIndex]);
                     }
                     if (anyCopied) {
+                        if (m_isD3D12) {
+                            // Submit the copies to the app's queue, ordered
+                            // after the frame's own rendering work.
+                            m_d3d12.Flush();
+                        }
                         m_ipc.PublishFrame(frameEndInfo->displayTime);
                     }
                 }

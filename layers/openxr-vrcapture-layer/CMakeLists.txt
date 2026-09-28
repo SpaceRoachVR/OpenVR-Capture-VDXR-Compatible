@@ -8,6 +8,7 @@ set(LAYER_SOURCES
     layer_main.cpp
     openxr_interceptor.cpp
     layer_ipc_producer.cpp
+    d3d12_interop.cpp
 )
 
 add_library(openxr-vrcapture-layer SHARED ${LAYER_SOURCES})
@@ -21,6 +22,7 @@ target_include_directories(openxr-vrcapture-layer PRIVATE
 target_compile_definitions(openxr-vrcapture-layer PRIVATE
     XR_USE_PLATFORM_WIN32
     XR_USE_GRAPHICS_API_D3D11
+    XR_USE_GRAPHICS_API_D3D12
     WIN32_LEAN_AND_MEAN
     NOMINMAX
 )
