@@ -31,9 +31,9 @@ if(MSVC)
 endif()
 
 if(TARGET libobs)
-	target_link_libraries(win-openvr PRIVATE libobs d3d11 dxgi)
+	target_link_libraries(win-openvr PRIVATE libobs d3d11 dxgi openvr_api)
 else()
-	target_link_libraries(win-openvr PRIVATE obs d3d11 dxgi)
+	target_link_libraries(win-openvr PRIVATE obs d3d11 dxgi openvr_api)
 endif()
 
 if(COMMAND set_target_properties_obs)

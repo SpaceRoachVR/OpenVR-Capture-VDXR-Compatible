@@ -13,8 +13,6 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <obs-module.h>
-#include <util/platform.h>
-#include <util/dstr.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <stdint.h>
@@ -40,15 +38,9 @@
 
 using Microsoft::WRL::ComPtr;
 
-#if defined(_MSC_VER)
-#pragma comment(lib, "d3d11.lib")
-#pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "lib/win64/openvr_api.lib")
-#endif
-
-static constexpr std::chrono::milliseconds retry_delay{8};              // per-call debounce, ~120Hz
-static constexpr std::chrono::milliseconds retry_delayBUFFER_base{500}; // base retry cadence, 2Hz
-static constexpr std::chrono::milliseconds retry_delayBUFFER_max{4000}; // maximum backoff limit
+static constexpr std::chrono::milliseconds retry_delay{8};          // per-call debounce, ~120Hz
+static constexpr std::chrono::milliseconds retry_backoff_base{500}; // base retry cadence, 2Hz
+static constexpr std::chrono::milliseconds retry_backoff_max{4000}; // maximum backoff limit
 
 static std::atomic<int> s_openvr_instances{0};
 static std::mutex s_openvr_init_mutex;
@@ -67,10 +59,6 @@ static std::atomic<uint64_t> s_openvr_mirror_generation{0};
 
 #define blog(log_level, message, ...) \
 	blog(log_level, "[win_vrcapture] " message, ##__VA_ARGS__)
-#define debug(message, ...) \
-	blog(LOG_DEBUG, "[%s] " message, (context && context->source) ? obs_source_get_name(context->source) : "win_vrcapture", ##__VA_ARGS__)
-#define info(message, ...) \
-	blog(LOG_INFO, "[%s] " message, (context && context->source) ? obs_source_get_name(context->source) : "win_vrcapture", ##__VA_ARGS__)
 #define warn(message, ...) \
 	blog(LOG_WARNING, "[%s] " message, (context && context->source) ? obs_source_get_name(context->source) : "win_vrcapture", ##__VA_ARGS__)
 
@@ -143,8 +131,8 @@ struct win_openvr {
 	// Set by show(): next tick retries immediately instead of waiting out the backoff.
 	std::atomic<bool> init_requested{false};
 	std::chrono::steady_clock::time_point last_init_time = std::chrono::steady_clock::now();
-	std::chrono::steady_clock::time_point last_init_timeBUFFER = std::chrono::steady_clock::now();
-	std::chrono::milliseconds retry_delayBUFFER_current{retry_delayBUFFER_base};
+	std::chrono::steady_clock::time_point last_backoff_attempt = std::chrono::steady_clock::now();
+	std::chrono::milliseconds retry_backoff_current{retry_backoff_base};
 };
 
 // Helper to destroy OBS texture safely inside graphics context
@@ -337,7 +325,7 @@ static void win_openvr_init(void *data, bool forced)
 		// tick would retry the forced path, bypassing backoff, every frame.
 		// Dropping it hands retries to the normal backoff path in tick().
 		context->initialized.store(false);
-		context->retry_delayBUFFER_current = std::min(context->retry_delayBUFFER_current * 2, retry_delayBUFFER_max);
+		context->retry_backoff_current = std::min(context->retry_backoff_current * 2, retry_backoff_max);
 		context->init_inprog.store(false);
 	};
 
@@ -428,7 +416,7 @@ static void win_openvr_init(void *data, bool forced)
 	context->mirror_generation = s_openvr_mirror_generation.load();
 	context->initialized.store(true);
 	context->init_inprog.store(false);
-	context->retry_delayBUFFER_current = retry_delayBUFFER_base; // Reset backoff on success
+	context->retry_backoff_current = retry_backoff_base; // Reset backoff on success
 }
 
 static void win_openvr_init1(void *data, bool forced)
@@ -442,11 +430,11 @@ static void win_openvr_init1(void *data, bool forced)
 
 	if (!forced) {
 		auto now = std::chrono::steady_clock::now();
-		if (now - context->last_init_timeBUFFER < context->retry_delayBUFFER_current) {
+		if (now - context->last_backoff_attempt < context->retry_backoff_current) {
 			return;
 		}
 	}
-	context->last_init_timeBUFFER = std::chrono::steady_clock::now();
+	context->last_backoff_attempt = std::chrono::steady_clock::now();
 
 	win_openvr_init(data, forced);
 }
@@ -479,13 +467,13 @@ static void win_openvr_deinit(void *data)
 	context->initialized.store(false);
 	context->init_inprog.store(false);
 	context->last_init_time = std::chrono::steady_clock::now();
-	context->last_init_timeBUFFER = std::chrono::steady_clock::now();
+	context->last_backoff_attempt = std::chrono::steady_clock::now();
 }
 
 static const char *win_openvr_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
-	return "VR Capture";
+	return obs_module_text("OpenVR");
 }
 
 static void win_openvr_update(void *data, obs_data_t *settings)
