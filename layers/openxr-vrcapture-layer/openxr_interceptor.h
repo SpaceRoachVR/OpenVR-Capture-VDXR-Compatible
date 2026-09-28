@@ -56,6 +56,10 @@ public:
 
 private:
     OpenXRInterceptor() = default;
+
+    // Copies one projection view into the given eye's shared texture.
+    // Returns true if a frame was handed to OBS.
+    bool CaptureView(VREyeSelection eye, const XrCompositionLayerProjectionView &view);
     ~OpenXRInterceptor() = default;
 
     PFN_xrGetInstanceProcAddr m_nextGetInstanceProcAddr = nullptr;

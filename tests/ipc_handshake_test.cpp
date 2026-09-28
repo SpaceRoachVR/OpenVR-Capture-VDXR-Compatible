@@ -1,6 +1,7 @@
-// Exercises the OBS <-> OpenXR-layer shared-memory handshake without OBS or a
+// Exercises the OBS <-> OpenXR-layer shared-memory protocol without OBS or a
 // headset: the real LayerIpcProducer (on a WARP D3D11 device) and the real
-// OpenXrIpcConsumer run in one process against the named mapping.
+// OpenXrIpcConsumer run in one process against the named mapping, and a second
+// D3D11 device stands in for OBS's GPU side of the keyed-mutex handoff.
 //
 // obs.dll is delay-loaded; none of the code paths used here call into it.
 
@@ -8,8 +9,8 @@
 #include "openxr_ipc_consumer.h"
 
 #include <cstdio>
-#include <vector>
 #include <cstdlib>
+#include <vector>
 
 using namespace vrcapture;
 
@@ -25,12 +26,68 @@ static int g_failures = 0;
 		}                                                               \
 	} while (0)
 
-// Reads the header the same way the layer/plugin do, for assertions.
-static VRSharedFrameHeader *PeekHeader(HANDLE &hMap)
+// Read-only view of the header, for assertions.
+struct HeaderView {
+	HANDLE map = nullptr;
+	const VRSharedFrameHeader *hdr = nullptr;
+	HeaderView()
+	{
+		map = OpenFileMappingW(FILE_MAP_READ, FALSE, VR_IPC_SHARED_MEMORY_NAME);
+		if (map)
+			hdr = reinterpret_cast<const VRSharedFrameHeader *>(
+				MapViewOfFile(map, FILE_MAP_READ, 0, 0, sizeof(VRSharedFrameHeader)));
+	}
+	~HeaderView()
+	{
+		if (hdr) UnmapViewOfFile(hdr);
+		if (map) CloseHandle(map);
+	}
+};
+
+static const uint32_t kLeft = EyeBit(VREyeSelection::Left);
+static const uint32_t kRight = EyeBit(VREyeSelection::Right);
+
+// Plays OBS's GPU side for one eye: opens the shared texture on another
+// device, takes key 1, reads it back, returns key 0. Checks that pixel (x, y)
+// equals the source pattern at (x + ox, y + oy).
+static bool ObsReadsEye(uint64_t handle, UINT w, UINT h, UINT ox, UINT oy)
 {
-	hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, VR_IPC_SHARED_MEMORY_NAME);
-	if (!hMap) return nullptr;
-	return reinterpret_cast<VRSharedFrameHeader *>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, sizeof(VRSharedFrameHeader)));
+	ComPtr<ID3D11Device> dev;
+	ComPtr<ID3D11DeviceContext> ctx;
+	if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
+				     dev.GetAddressOf(), nullptr, ctx.GetAddressOf())))
+		return false;
+	ComPtr<ID3D11Texture2D> shared;
+	if (FAILED(dev->OpenSharedResource(reinterpret_cast<HANDLE>(handle), IID_PPV_ARGS(shared.GetAddressOf()))))
+		return false;
+	ComPtr<IDXGIKeyedMutex> km;
+	if (FAILED(shared.As(&km)) || km->AcquireSync(1, 1000) != S_OK)
+		return false;
+
+	D3D11_TEXTURE2D_DESC d = {};
+	shared->GetDesc(&d);
+	d.Usage = D3D11_USAGE_STAGING;
+	d.BindFlags = 0;
+	d.MiscFlags = 0;
+	d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+	ComPtr<ID3D11Texture2D> staging;
+	dev->CreateTexture2D(&d, nullptr, staging.GetAddressOf());
+	ctx->CopyResource(staging.Get(), shared.Get());
+	km->ReleaseSync(0);
+
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	bool ok = d.Width == w && d.Height == h && SUCCEEDED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m));
+	for (UINT y = 0; ok && y < h; ++y) {
+		const uint32_t *row = reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(m.pData) + y * m.RowPitch);
+		for (UINT x = 0; x < w; ++x) {
+			if (row[x] != (0xFF000000u | ((y + oy) << 8) | (x + ox))) {
+				ok = false;
+				break;
+			}
+		}
+	}
+	if (m.pData) ctx->Unmap(staging.Get(), 0);
+	return ok;
 }
 
 int main()
@@ -49,52 +106,45 @@ int main()
 		LayerIpcProducer producer;
 		CHECK(!producer.TryAttach());
 		CHECK(!producer.IsObsConnected());
-		CHECK(!producer.Initialize(device.Get(), 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM));
+		CHECK(!producer.Initialize(VREyeSelection::Right, device.Get(), 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM));
 	}
 
-	std::printf("2. OBS source created -> OBS owns the mapping\n");
-	OpenXrIpcConsumer consumer;
-	CHECK(consumer.Initialize());
+	std::printf("2. OBS sources created: one shared consumer, no mapping until a source wants OpenXR\n");
+	std::shared_ptr<OpenXrIpcConsumer> consumer = OpenXrIpcConsumer::Acquire();
+	CHECK(OpenXrIpcConsumer::Acquire() == consumer);
+	const uint32_t leftSrc = consumer->AddClient();
+	const uint32_t rightSrc = consumer->AddClient();
+	consumer->SetInterest(leftSrc, false, VREyeSelection::Left);
+	consumer->SetInterest(rightSrc, false, VREyeSelection::Right);
+	CHECK(HeaderView().hdr == nullptr);
+	CHECK(consumer->Initialize()); // what the Auto-mode producer probe does
 	{
-		HANDLE h = nullptr;
-		VRSharedFrameHeader *hdr = PeekHeader(h);
-		CHECK(hdr != nullptr);
-		if (hdr) {
-			CHECK(hdr->magic == VR_IPC_MAGIC);
-			CHECK(hdr->version == VR_IPC_VERSION);
-			CHECK(hdr->active_backend == VRBackendType::Inactive);
-			UnmapViewOfFile(hdr);
+		HeaderView v;
+		CHECK(v.hdr != nullptr);
+		if (v.hdr) {
+			CHECK(v.hdr->magic == VR_IPC_MAGIC);
+			CHECK(v.hdr->version == VR_IPC_VERSION);
+			CHECK(v.hdr->active_backend == VRBackendType::Inactive);
+			CHECK(v.hdr->obs_connected == 0 && v.hdr->requested_eye_mask == 0);
 		}
-		if (h) CloseHandle(h);
 	}
-	CHECK(!consumer.IsProducerActive());
+	CHECK(!consumer->IsProducerActive());
 
 	std::printf("3. layer attaches (first attempt is not throttled)\n");
 	LayerIpcProducer producer;
 	CHECK(producer.TryAttach());
-	CHECK(consumer.IsProducerActive());
-	CHECK(!producer.IsObsConnected()); // source not shown yet
+	CHECK(consumer->IsProducerActive());
+	CHECK(!producer.IsObsConnected()); // no source shown yet
+	CHECK(producer.GetRequestedEyeMask() == 0);
 
-	std::printf("4. source shown -> producer sees OBS and publishes a texture\n");
-	consumer.SetConnected(true);
+	std::printf("4. left + right sources shown: producer is asked for both eyes\n");
+	consumer->SetInterest(rightSrc, true, VREyeSelection::Right);
 	CHECK(producer.IsObsConnected());
-	CHECK(producer.Initialize(device.Get(), 64, 32, DXGI_FORMAT_R8G8B8A8_UNORM));
-	CHECK(producer.HasTexture(64, 32, DXGI_FORMAT_R8G8B8A8_UNORM));
-	uint64_t sharedHandle = 0;
-	{
-		HANDLE h = nullptr;
-		VRSharedFrameHeader *hdr = PeekHeader(h);
-		if (hdr) {
-			sharedHandle = hdr->shared_handle;
-			CHECK(hdr->shared_handle != 0);
-			CHECK(hdr->texture_width == 64 && hdr->texture_height == 32);
-			CHECK((hdr->seq & 1) == 0);
-			UnmapViewOfFile(hdr);
-		}
-		if (h) CloseHandle(h);
-	}
+	CHECK(producer.GetRequestedEyeMask() == kRight);
+	consumer->SetInterest(leftSrc, true, VREyeSelection::Left);
+	CHECK(producer.GetRequestedEyeMask() == (kLeft | kRight));
 
-	std::printf("5. CopyFrame + keyed-mutex handoff (OBS side simulated on a 2nd device)\n");
+	std::printf("5. per-eye textures, copies and keyed-mutex handoff\n");
 	// "Swapchain image": 128x64, pixel (x,y) encodes its own coordinates.
 	const UINT srcW = 128, srcH = 64;
 	std::vector<uint32_t> pixels(srcW * srcH);
@@ -114,85 +164,85 @@ int main()
 	ComPtr<ID3D11Texture2D> src;
 	CHECK(SUCCEEDED(device->CreateTexture2D(&sd, &init, src.GetAddressOf())));
 
-	const D3D11_BOX box = {32, 16, 0, 96, 48, 1}; // 64x32 region
-	CHECK(producer.CopyFrame(ctx.Get(), src.Get(), 0, box, 0, nullptr, nullptr, nullptr));
+	// Side-by-side "stereo" image: left view is the left half, right view the right half.
+	const D3D11_BOX leftBox = {0, 16, 0, 64, 48, 1};
+	const D3D11_BOX rightBox = {64, 16, 0, 128, 48, 1};
+
+	CHECK(!producer.CopyEye(VREyeSelection::Left, ctx.Get(), src.Get(), 0, leftBox, nullptr, nullptr, nullptr)); // no texture yet
+	CHECK(producer.Initialize(VREyeSelection::Left, device.Get(), 64, 32, DXGI_FORMAT_R8G8B8A8_UNORM));
+	CHECK(producer.Initialize(VREyeSelection::Right, device.Get(), 64, 32, DXGI_FORMAT_R8G8B8A8_UNORM));
+	CHECK(producer.HasTexture(VREyeSelection::Left, 64, 32, DXGI_FORMAT_R8G8B8A8_UNORM));
+
+	uint64_t leftHandle = 0, rightHandle = 0;
+	{
+		HeaderView v;
+		if (v.hdr) {
+			leftHandle = v.hdr->eyes[0].shared_handle;
+			rightHandle = v.hdr->eyes[1].shared_handle;
+			CHECK(leftHandle != 0 && rightHandle != 0 && leftHandle != rightHandle);
+			CHECK(v.hdr->eyes[1].texture_width == 64 && v.hdr->eyes[1].texture_height == 32);
+			CHECK((v.hdr->seq & 1) == 0);
+		}
+	}
+
+	const float fovL[4] = {-1, 0.5f, 1, -1}, fovR[4] = {-0.5f, 1, 1, -1};
+	CHECK(producer.CopyEye(VREyeSelection::Left, ctx.Get(), src.Get(), 0, leftBox, fovL, nullptr, nullptr));
+	CHECK(producer.CopyEye(VREyeSelection::Right, ctx.Get(), src.Get(), 0, rightBox, fovR, nullptr, nullptr));
+	producer.PublishFrame(1234);
 	ctx->Flush();
-	CHECK(!producer.CopyFrame(ctx.Get(), src.Get(), 0, box, 0, nullptr, nullptr, nullptr)); // OBS still holds key
+	CHECK(!producer.CopyEye(VREyeSelection::Right, ctx.Get(), src.Get(), 0, rightBox, fovR, nullptr, nullptr)); // OBS holds key
 
+	CHECK(ObsReadsEye(leftHandle, 64, 32, 0, 16));   // left eye got the left view
+	CHECK(ObsReadsEye(rightHandle, 64, 32, 64, 16)); // right eye got the right view
+
+	CHECK(producer.CopyEye(VREyeSelection::Right, ctx.Get(), src.Get(), 0, rightBox, fovR, nullptr, nullptr)); // key returned
 	const D3D11_BOX wrongSize = {0, 0, 0, 80, 32, 1};
-
+	CHECK(!producer.CopyEye(VREyeSelection::Left, ctx.Get(), src.Get(), 0, wrongSize, fovL, nullptr, nullptr)); // resize pending
+	producer.PublishFrame(5678);
 	{
-		// OBS: open the shared texture on its own device, take key 1, copy out, give key 0 back.
-		ComPtr<ID3D11Device> obsDevice;
-		ComPtr<ID3D11DeviceContext> obsCtx;
-		D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
-				  obsDevice.GetAddressOf(), nullptr, obsCtx.GetAddressOf());
-		ComPtr<ID3D11Texture2D> shared;
-		HRESULT ohr = obsDevice ? obsDevice->OpenSharedResource(reinterpret_cast<HANDLE>(sharedHandle),
-									  IID_PPV_ARGS(shared.GetAddressOf()))
-					: E_FAIL;
-		CHECK(SUCCEEDED(ohr));
-		ComPtr<IDXGIKeyedMutex> km;
-		if (shared) shared.As(&km);
-		CHECK(km != nullptr);
-		if (km) {
-			CHECK(km->AcquireSync(1, 1000) == S_OK);
-
-			D3D11_TEXTURE2D_DESC stDesc = {};
-			shared->GetDesc(&stDesc);
-			stDesc.Usage = D3D11_USAGE_STAGING;
-			stDesc.BindFlags = 0;
-			stDesc.MiscFlags = 0;
-			stDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-			ComPtr<ID3D11Texture2D> staging;
-			obsDevice->CreateTexture2D(&stDesc, nullptr, staging.GetAddressOf());
-			obsCtx->CopyResource(staging.Get(), shared.Get());
-			km->ReleaseSync(0);
-
-			D3D11_MAPPED_SUBRESOURCE m = {};
-			bool contentOk = SUCCEEDED(obsCtx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m));
-			for (UINT y = 0; contentOk && y < 32; ++y) {
-				const uint32_t *row = reinterpret_cast<const uint32_t *>(static_cast<const uint8_t *>(m.pData) + y * m.RowPitch);
-				for (UINT x = 0; x < 64; ++x) {
-					if (row[x] != (0xFF000000u | ((y + 16) << 8) | (x + 32))) {
-						contentOk = false;
-						break;
-					}
-				}
-			}
-			if (m.pData) obsCtx->Unmap(staging.Get(), 0);
-			CHECK(contentOk); // the crop box landed at (0,0) of the shared texture
+		HeaderView v;
+		if (v.hdr) {
+			CHECK(v.hdr->frame_index == 2);
+			CHECK(v.hdr->display_time_ns == 5678);
+			CHECK(v.hdr->eyes[0].fov[1] == 0.5f && v.hdr->eyes[1].fov[1] == 1.0f);
+			CHECK((v.hdr->seq & 1) == 0);
 		}
 	}
 
-	CHECK(producer.CopyFrame(ctx.Get(), src.Get(), 0, box, 0, nullptr, nullptr, nullptr)); // key returned
-	CHECK(!producer.CopyFrame(ctx.Get(), src.Get(), 0, wrongSize, 0, nullptr, nullptr, nullptr)); // resize pending
-	{
-		HANDLE h = nullptr;
-		VRSharedFrameHeader *hdr = PeekHeader(h);
-		if (hdr) {
-			CHECK(hdr->frame_index == 2);
-			CHECK((hdr->seq & 1) == 0);
-			UnmapViewOfFile(hdr);
-		}
-		if (h) CloseHandle(h);
-	}
+	std::printf("6. hiding one source keeps the other connected\n");
+	consumer->SetInterest(rightSrc, false, VREyeSelection::Right);
+	CHECK(producer.IsObsConnected());
+	CHECK(producer.GetRequestedEyeMask() == kLeft);
 
-	std::printf("6. source hidden -> producer stops\n");
-	consumer.SetConnected(false);
+	std::printf("7. switching a source's eye updates the mask\n");
+	consumer->SetInterest(leftSrc, true, VREyeSelection::Right);
+	CHECK(producer.GetRequestedEyeMask() == kRight);
+
+	std::printf("8. last visible source hidden / removed -> producer stops\n");
+	consumer->SetInterest(leftSrc, false, VREyeSelection::Right);
+	CHECK(!producer.IsObsConnected());
+	CHECK(producer.GetRequestedEyeMask() == 0);
+	consumer->SetInterest(leftSrc, true, VREyeSelection::Left);
+	CHECK(producer.IsObsConnected());
+	consumer->RemoveClient(leftSrc);
 	CHECK(!producer.IsObsConnected());
 
-	std::printf("7. game session ends -> OBS sees producer inactive\n");
+	std::printf("9. game session ends -> OBS sees producer inactive, handles cleared\n");
 	producer.Shutdown();
-	CHECK(!consumer.IsProducerActive());
+	CHECK(!consumer->IsProducerActive());
+	{
+		HeaderView v;
+		if (v.hdr) CHECK(v.hdr->eyes[0].shared_handle == 0 && v.hdr->eyes[1].shared_handle == 0);
+	}
 
-	std::printf("8. new session re-attaches immediately after Shutdown\n");
+	std::printf("10. new session re-attaches immediately after Shutdown\n");
 	CHECK(producer.TryAttach());
-	CHECK(consumer.IsProducerActive());
+	CHECK(consumer->IsProducerActive());
 	producer.Shutdown();
 
-	std::printf("9. OBS closed -> mapping gone, layer can't attach\n");
-	consumer.Shutdown();
+	std::printf("11. last OBS source destroyed -> mapping gone, layer can't attach\n");
+	consumer->RemoveClient(rightSrc);
+	consumer.reset();
 	{
 		LayerIpcProducer late;
 		CHECK(!late.TryAttach());

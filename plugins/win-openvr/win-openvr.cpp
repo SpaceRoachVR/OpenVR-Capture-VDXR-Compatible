@@ -89,7 +89,9 @@ struct win_openvr {
 	CaptureEngineMode active_engine = CaptureEngineMode::Auto;
 
 	// OpenXR Consumer Backend
-	std::unique_ptr<vrcapture::OpenXrIpcConsumer> openxr_consumer;
+	// Process-wide consumer shared by all sources; this source is one client.
+	std::shared_ptr<vrcapture::OpenXrIpcConsumer> openxr_consumer;
+	uint32_t openxr_client = 0;
 
 	// Settings
 	bool righteye = true;
@@ -149,6 +151,22 @@ struct win_openvr {
 static bool uses_openxr_ipc(const win_openvr *context)
 {
 	return context->openxr_consumer && context->engine_mode != CaptureEngineMode::OpenVR_SteamVR;
+}
+
+static vrcapture::VREyeSelection openxr_eye(const win_openvr *context)
+{
+	return context->righteye ? vrcapture::VREyeSelection::Right : vrcapture::VREyeSelection::Left;
+}
+
+// Tells the shared consumer whether this source currently wants OpenXR frames
+// and for which eye. The consumer advertises the union over all sources.
+static void publish_openxr_interest(win_openvr *context)
+{
+	if (context->openxr_consumer) {
+		context->openxr_consumer->SetInterest(context->openxr_client,
+						      context->active.load() && uses_openxr_ipc(context),
+						      openxr_eye(context));
+	}
 }
 
 static void destroy_obs_texture(gs_texture_t **texture) {
@@ -526,7 +544,7 @@ static uint32_t win_openvr_getwidth(void *data)
 	win_openvr *context = (win_openvr *)data;
 	if (!context) return 100;
 	if (context->active_engine == CaptureEngineMode::OpenXR_VDXR && context->openxr_consumer) {
-		return context->width > 0 ? context->width : context->openxr_consumer->GetWidth();
+		return context->width > 0 ? context->width : context->openxr_consumer->GetWidth(openxr_eye(context));
 	}
 	return context->width > 0 ? context->width : 100;
 }
@@ -536,7 +554,7 @@ static uint32_t win_openvr_getheight(void *data)
 	win_openvr *context = (win_openvr *)data;
 	if (!context) return 100;
 	if (context->active_engine == CaptureEngineMode::OpenXR_VDXR && context->openxr_consumer) {
-		return context->height > 0 ? context->height : context->openxr_consumer->GetHeight();
+		return context->height > 0 ? context->height : context->openxr_consumer->GetHeight(openxr_eye(context));
 	}
 	return context->height > 0 ? context->height : 100;
 }
@@ -546,10 +564,7 @@ static void win_openvr_show(void *data)
 	win_openvr *context = (win_openvr *)data;
 	if (!context) return;
 	context->active.store(true);
-
-	if (uses_openxr_ipc(context)) {
-		context->openxr_consumer->SetConnected(true);
-	}
+	publish_openxr_interest(context);
 
 	if (context->engine_mode != CaptureEngineMode::OpenXR_VDXR && !context->initialized.load()) {
 		win_openvr_init1(data, true); // forced
@@ -561,17 +576,15 @@ static void win_openvr_hide(void *data)
 	win_openvr *context = (win_openvr *)data;
 	if (!context) return;
 	context->active.store(false); // pause copy/render only
-
-	if (uses_openxr_ipc(context)) {
-		context->openxr_consumer->SetConnected(false);
-	}
+	publish_openxr_interest(context); // other visible sources keep OBS connected
 }
 
 static void *win_openvr_create(obs_data_t *settings, obs_source_t *source)
 {
 	win_openvr *context = new win_openvr();
 	context->source = source;
-	context->openxr_consumer = std::make_unique<vrcapture::OpenXrIpcConsumer>();
+	context->openxr_consumer = vrcapture::OpenXrIpcConsumer::Acquire();
+	context->openxr_client = context->openxr_consumer->AddClient();
 
 	win_openvr_update(context, settings);
 	return context;
@@ -583,7 +596,9 @@ static void win_openvr_destroy(void *data)
 	if (!context) return;
 
 	if (context->openxr_consumer) {
-		context->openxr_consumer->Shutdown();
+		// Drops this source's interest; the shared mapping is released when
+		// the last source goes away.
+		context->openxr_consumer->RemoveClient(context->openxr_client);
 		context->openxr_consumer.reset();
 	}
 
@@ -603,7 +618,7 @@ static void win_openvr_render(void *data, gs_effect_t *effect)
 	// Backend 1: OpenXR / VDXR Render Path. Same crop/zoom/offset rectangle
 	// as the OpenVR path; tick() keeps it in sync with the frame size.
 	if (context->active_engine == CaptureEngineMode::OpenXR_VDXR && context->openxr_consumer &&
-	    context->openxr_consumer->GetTexture()) {
+	    context->openxr_consumer->GetTexture(openxr_eye(context))) {
 		uint32_t x, y, cx, cy;
 		{
 			std::lock_guard<std::mutex> lock(context->mutex);
@@ -612,7 +627,7 @@ static void win_openvr_render(void *data, gs_effect_t *effect)
 			cx = context->width;
 			cy = context->height;
 		}
-		if (context->openxr_consumer->Render(effect, x, y, cx, cy)) {
+		if (context->openxr_consumer->Render(openxr_eye(context), effect, x, y, cx, cy)) {
 			return;
 		}
 	}
@@ -696,6 +711,7 @@ static void win_openvr_tick(void *data, float seconds)
 	if (!context) return;
 
 	context->active.store(obs_source_showing(context->source));
+	publish_openxr_interest(context);
 
 	// Dual-Engine Resolution and Auto-Detection
 	bool openxr_active = uses_openxr_ipc(context) && context->openxr_consumer->IsProducerActive();
@@ -715,10 +731,10 @@ static void win_openvr_tick(void *data, float seconds)
 
 	// Update OpenXR if active
 	if (context->active_engine == CaptureEngineMode::OpenXR_VDXR && context->openxr_consumer && context->active.load()) {
-		vrcapture::VREyeSelection eye = context->righteye ? vrcapture::VREyeSelection::Right : vrcapture::VREyeSelection::Left;
+		const vrcapture::VREyeSelection eye = openxr_eye(context);
 		if (context->openxr_consumer->UpdateTexture(eye)) {
-			const uint32_t w = context->openxr_consumer->GetWidth();
-			const uint32_t h = context->openxr_consumer->GetHeight();
+			const uint32_t w = context->openxr_consumer->GetWidth(eye);
+			const uint32_t h = context->openxr_consumer->GetHeight(eye);
 			std::lock_guard<std::mutex> lock(context->mutex);
 			if (context->device_width != w || context->device_height != h) {
 				context->device_width = w;

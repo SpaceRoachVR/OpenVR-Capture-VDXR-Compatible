@@ -23,6 +23,8 @@
 | A5 (partial): correct subresource index, MSAA + out-of-bounds rects skipped | ✅ done (copy still happens in `xrEndFrame`) |
 | B1: consumer copies into an OBS-owned texture once per tick, always draws it | ✅ done, verify with `tests/fake_producer` |
 | B2: zoom / aspect / offsets applied to the OpenXR draw | ✅ done, verify with `tests/fake_producer` |
+| C1: runtime references released on SteamVR quit even after failed init; stale `VRSystem` never reused | ✅ done (code review only; needs a SteamVR quit/restart test) |
+| B3: per-eye textures + eye mask (IPC v3); one shared consumer per OBS process; hiding one source no longer disconnects others | ✅ done, covered by `tests/ipc_handshake_test` |
 | Everything else | open |
 
 ---

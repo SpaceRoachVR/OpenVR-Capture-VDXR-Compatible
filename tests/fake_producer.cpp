@@ -2,9 +2,13 @@
 //
 // Drives the real LayerIpcProducer exactly the way xrEndFrame does: attaches to
 // OBS's mapping, waits for a visible OBS source, then publishes an animated
-// test pattern at a configurable rate through CopyFrame.
+// test pattern at a configurable rate through CopyEye/PublishFrame.
 //
-// Usage: fake_producer [fps=72] [width=1920] [height=1920]
+// Usage: fake_producer [fps=72] [width=3840] [height=1920]
+//
+// The image is side-by-side stereo: the left half is the left eye (marked with
+// a blue block), the right half the right eye (a red block), so left- and
+// right-eye sources are easy to tell apart.
 //
 // What you should see in OBS (VR Capture source, engine Auto or VDXR/OpenXR):
 //   - a grid with a white bar sweeping left->right and a frame counter
@@ -27,7 +31,7 @@ using Clock = std::chrono::steady_clock;
 int main(int argc, char **argv)
 {
 	const int fps = argc > 1 ? std::max(1, atoi(argv[1])) : 72;
-	const UINT width = argc > 2 ? static_cast<UINT>(std::max(16, atoi(argv[2]))) : 1920;
+	const UINT width = argc > 2 ? static_cast<UINT>(std::max(32, atoi(argv[2]))) & ~1u : 3840;
 	const UINT height = argc > 3 ? static_cast<UINT>(std::max(16, atoi(argv[3]))) : 1920;
 
 	// Hardware device: OBS opens the shared handle on its own GPU device, and
@@ -84,8 +88,12 @@ int main(int argc, char **argv)
 			wasConnected = true;
 		}
 
-		if (!producer.HasTexture(width, height, sd.Format)) {
-			producer.Initialize(device.Get(), width, height, sd.Format);
+		const uint32_t eyeMask = producer.GetRequestedEyeMask();
+		for (uint32_t e = 0; e < VR_IPC_EYE_COUNT; ++e) {
+			const VREyeSelection eye = static_cast<VREyeSelection>(e);
+			if ((eyeMask & EyeBit(eye)) && !producer.HasTexture(eye, width / 2, height, sd.Format)) {
+				producer.Initialize(eye, device.Get(), width / 2, height, sd.Format);
+			}
 		}
 
 		// Grid, a sweeping white bar, and a top band whose colour encodes
@@ -97,8 +105,12 @@ int main(int argc, char **argv)
 			uint32_t *row = &pixels[size_t(y) * width];
 			for (UINT x = 0; x < width; ++x) {
 				uint32_t c;
+				const UINT half = width / 2, ex = x % half;
+				const bool rightEye = x >= half;
 				if (y < height / 16) {
 					c = band;
+				} else if (ex >= half / 8 && ex < half / 8 + half / 16 && y >= height / 8 && y < height / 8 + height / 8) {
+					c = rightEye ? 0xFF0000FFu : 0xFFFF0000u; // right = red block, left = blue block
 				} else if (x >= bar && x < bar + width / 64) {
 					c = 0xFFFFFFFFu;
 				} else if ((x / 64 + y / 64) & 1) {
@@ -111,8 +123,16 @@ int main(int argc, char **argv)
 		}
 		ctx->UpdateSubresource(image.Get(), 0, nullptr, pixels.data(), width * 4, 0);
 
-		const D3D11_BOX box = {0, 0, 0, width, height, 1};
-		if (producer.CopyFrame(ctx.Get(), image.Get(), 0, box, 0, nullptr, nullptr, nullptr)) {
+		// Side-by-side stereo image: left half = left eye, right half = right eye.
+		bool any = false;
+		for (uint32_t e = 0; e < VR_IPC_EYE_COUNT; ++e) {
+			const VREyeSelection eye = static_cast<VREyeSelection>(e);
+			if (!(eyeMask & EyeBit(eye))) continue;
+			const D3D11_BOX box = {e * (width / 2), 0, 0, (e + 1) * (width / 2), height, 1};
+			any |= producer.CopyEye(eye, ctx.Get(), image.Get(), 0, box, nullptr, nullptr, nullptr);
+		}
+		if (any) {
+			producer.PublishFrame(0);
 			++published;
 		} else {
 			++dropped; // OBS hadn't taken the previous frame yet: expected when fps > OBS fps

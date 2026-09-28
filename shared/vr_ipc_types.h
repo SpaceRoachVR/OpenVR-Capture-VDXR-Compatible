@@ -11,7 +11,9 @@ namespace vrcapture {
 // Magic identifier for SpaceRoachVR / VR Capture IPC ("VRCP" = 0x56524350)
 static constexpr uint32_t VR_IPC_MAGIC = 0x56524350;
 // v2: the OBS consumer creates and owns the mapping; the layer only opens it.
-static constexpr uint32_t VR_IPC_VERSION = 2;
+// v3: one texture per eye, requested via an eye mask, so several OBS sources
+//     (e.g. left + right eye) no longer fight over a single shared texture.
+static constexpr uint32_t VR_IPC_VERSION = 3;
 
 // Upper bound on texture_width/texture_height accepted from the shared header.
 // The header is written by another process, so dimensions must be sanity-checked
@@ -34,48 +36,54 @@ enum class VRBackendType : uint32_t {
 enum class VREyeSelection : uint32_t {
     Left = 0,
     Right = 1,
-    StereoBoth = 2
+};
+
+static constexpr uint32_t VR_IPC_EYE_COUNT = 2;
+
+inline uint32_t EyeBit(VREyeSelection eye)
+{
+    return 1u << static_cast<uint32_t>(eye);
+}
+
+// Producer-owned, one per eye. Written only inside the header's seqlock.
+struct VRSharedEyeTexture {
+    uint64_t shared_handle;             // Legacy DXGI shared handle (castable to HANDLE), 0 = none
+    uint32_t texture_width;
+    uint32_t texture_height;
+    uint32_t dxgi_format;               // DXGI_FORMAT
+    uint32_t reserved0;
+
+    // Metadata of the frame last copied into this texture
+    float fov[4];                       // left, right, up, down (radians)
+    float pose_orientation[4];          // x, y, z, w
+    float pose_position[3];             // meters
+    float reserved1;
 };
 
 struct VRSharedFrameHeader {
     uint32_t magic;                     // Must match VR_IPC_MAGIC
     uint32_t version;                   // Protocol version (VR_IPC_VERSION)
 
-    // Seqlock guarding the "Frame tracking & timing" and "6-DoF Head Pose" blocks
-    // below: producer increments this (odd = write in progress, even = stable)
-    // around each update; a cross-process reader retries if it observes an odd
-    // value or the value changes across the read, so it never sees a torn mix of
-    // an old pose paired with a new frame_index (or vice versa).
+    // Seqlock guarding every producer-owned field below: the producer
+    // increments it (odd = write in progress, even = stable) around each
+    // update; a cross-process reader retries if it observes an odd value or the
+    // value changes across the read, so it never pairs a new texture handle
+    // with old dimensions, or a new frame_index with old metadata.
     volatile LONG seq;
 
-    // Backend state
-    VRBackendType active_backend;       // 1 = OpenXR/VDXR, 2 = OpenVR
+    // ---- Producer (layer) -> OBS ----
+    VRBackendType active_backend;       // OpenXR_VDXR while a capturable session is attached
     uint32_t is_d3d12;                  // 1 if source app was D3D12, 0 if D3D11
 
-    // Texture information for OBS consumption
-    uint64_t shared_handle;             // Windows DXGI Shared Handle (castable to HANDLE)
-    uint32_t texture_width;             // Native resolution width
-    uint32_t texture_height;            // Native resolution height
-    uint32_t dxgi_format;               // DXGI_FORMAT (e.g. DXGI_FORMAT_R8G8B8A8_UNORM)
+    VRSharedEyeTexture eyes[VR_IPC_EYE_COUNT]; // indexed by VREyeSelection
 
-    // Frame tracking & timing
-    uint64_t frame_index;               // Incremented per submitted frame
-    int64_t display_time_ns;            // Predicted display time in nanoseconds
+    uint64_t frame_index;               // Incremented per frame in which any eye was published
+    int64_t display_time_ns;            // Predicted display time of that frame
     uint64_t last_producer_heartbeat;   // GetTickCount64() timestamp from game process
 
-    // VR Field of View (angles in radians)
-    float fov_left;                     // Left tangent
-    float fov_right;                    // Right tangent
-    float fov_up;                       // Up tangent
-    float fov_down;                     // Down tangent
-
-    // 6-DoF Head Pose (Quaternion + Position in meters)
-    float pose_orientation[4];          // x, y, z, w
-    float pose_position[3];             // x, y, z
-
-    // Control parameters from OBS -> Layer
-    uint32_t requested_eye;             // VREyeSelection (0 = Left, 1 = Right, 2 = Both)
-    uint32_t obs_connected;             // 1 if OBS source is active and reading, 0 otherwise
+    // ---- OBS -> producer (layer) ----
+    uint32_t requested_eye_mask;        // OR of EyeBit() for every visible OBS source
+    uint32_t obs_connected;             // 1 while at least one OBS source is visible
     uint64_t last_consumer_heartbeat;   // GetTickCount64() timestamp from OBS
 };
 
