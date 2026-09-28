@@ -64,11 +64,14 @@ if (-not [string]::IsNullOrEmpty($ManifestPath)) {
         "$RootDir\build\layers\$ManifestFileName",
         "$RootDir\build\ninja-layer\$ManifestFileName"
     )
-    foreach ($p in $Candidates) {
-        if ((Test-Path $p) -and (Get-ManifestDll $p)) {
-            $ManifestPath = (Resolve-Path $p).Path
-            break
-        }
+    # Of the usable manifests, take the one whose DLL was built most recently,
+    # so a stale copy (e.g. an old bin\ folder) never wins over a fresh build.
+    $ManifestPath = $Candidates |
+        Where-Object { (Test-Path $_) -and (Get-ManifestDll $_) } |
+        Sort-Object { (Get-Item (Get-ManifestDll $_)).LastWriteTime } -Descending |
+        Select-Object -First 1
+    if ($ManifestPath) {
+        $ManifestPath = (Resolve-Path $ManifestPath).Path
     }
 }
 
@@ -81,7 +84,8 @@ if ([string]::IsNullOrEmpty($ManifestPath)) {
         "$RootDir\build\layers\Release\$DllFileName",
         "$RootDir\build\ninja-layer\$DllFileName"
     )
-    $DllPath = $DllCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    $DllPath = $DllCandidates | Where-Object { Test-Path $_ } |
+        Sort-Object { (Get-Item $_).LastWriteTime } -Descending | Select-Object -First 1
     if (-not $DllPath) {
         throw "Could not find $DllFileName. Build the layer first (see README) or pass -ManifestPath."
     }
