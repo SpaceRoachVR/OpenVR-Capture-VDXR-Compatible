@@ -11,6 +11,7 @@
 #endif
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <obs-module.h>
 #include <util/platform.h>
 #include <util/dstr.h>
@@ -23,10 +24,9 @@
 #include <mutex>
 #include <memory>
 #include <wrl/client.h>
-#include <cassert>
 
 #include "openxr_ipc_consumer.h"
-#include "../../shared/vr_shared_texture.h"
+#include "obs_draw_util.h"
 
 #if __has_include(<openvr.h>)
 #include <openvr.h>
@@ -102,7 +102,10 @@ struct win_openvr {
 
 	uint32_t lastFrame = 0;
 
-	// OpenVR D3D11 Resources
+	// OpenVR resources. The mirror texture is opened on OBS's own D3D11
+	// device, and each new compositor frame is copied into `texture`, an
+	// OBS-owned texture of the same size, with OBS's immediate context -- no
+	// second device, no cross-device sharing, no Flush().
 	gs_texture_t *texture = nullptr;
 	ComPtr<ID3D11Resource> tex = nullptr;
 	// Deliberately a raw pointer, NOT a ComPtr: openvr.h states the mirror SRV
@@ -110,10 +113,7 @@ struct win_openvr {
 	// Release on the resource itself". A ComPtr would call Release() on
 	// Reset()/destruction and corrupt the compositor's tracking of it.
 	ID3D11ShaderResourceView *mirrorSrv = nullptr;
-	ComPtr<ID3D11Device> shared_device = nullptr;
-	ComPtr<ID3D11DeviceContext> shared_context = nullptr;
-
-	ComPtr<ID3D11Texture2D> texCrop = nullptr;
+	bool logged_mirror_format = false;
 
 	// Texture dimensions and crop rectangle
 	unsigned int device_width = 0;
@@ -140,6 +140,8 @@ struct win_openvr {
 
 	// Per-instance throttle/re-entrancy state
 	std::atomic<bool> init_inprog{false};
+	// Set by show(): next tick retries immediately instead of waiting out the backoff.
+	std::atomic<bool> init_requested{false};
 	std::chrono::steady_clock::time_point last_init_time = std::chrono::steady_clock::now();
 	std::chrono::steady_clock::time_point last_init_timeBUFFER = std::chrono::steady_clock::now();
 	std::chrono::milliseconds retry_delayBUFFER_current{retry_delayBUFFER_base};
@@ -166,15 +168,6 @@ static void publish_openxr_interest(win_openvr *context)
 		context->openxr_consumer->SetInterest(context->openxr_client,
 						      context->active.load() && uses_openxr_ipc(context),
 						      openxr_eye(context));
-	}
-}
-
-static void destroy_obs_texture(gs_texture_t **texture) {
-	if (texture && *texture) {
-		obs_enter_graphics();
-		gs_texture_destroy(*texture);
-		obs_leave_graphics();
-		*texture = nullptr;
 	}
 }
 
@@ -253,38 +246,66 @@ static void recalculate_crop_dimensions_locked(win_openvr *context)
 	context->y = static_cast<unsigned int>(y);
 }
 
-static bool recreate_crop_texture_locked(win_openvr *context)
+// Lock order everywhere is: OBS graphics lock, then context->mutex. render()
+// is entered by OBS with the graphics lock held, so any other path that needs
+// both must take them in the same order.
+struct GraphicsGuard {
+	GraphicsGuard() { obs_enter_graphics(); }
+	~GraphicsGuard() { obs_leave_graphics(); }
+	GraphicsGuard(const GraphicsGuard &) = delete;
+	GraphicsGuard &operator=(const GraphicsGuard &) = delete;
+};
+
+// VR_Init runs on OBS's graphics thread. While SteamVR is down it would fail
+// anyway, but only after loading vrclient and probing for the server; checking
+// for the server process first keeps the idle retry loop to a cheap snapshot.
+static bool steamvr_server_running()
 {
-	if (!context->shared_device) {
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snap == INVALID_HANDLE_VALUE) {
+		return true; // can't tell; let VR_Init decide
+	}
+	PROCESSENTRY32W entry = {};
+	entry.dwSize = sizeof(entry);
+	bool found = false;
+	for (BOOL ok = Process32FirstW(snap, &entry); ok; ok = Process32NextW(snap, &entry)) {
+		if (_wcsicmp(entry.szExeFile, L"vrserver.exe") == 0) {
+			found = true;
+			break;
+		}
+	}
+	CloseHandle(snap);
+	return found;
+}
+
+// Makes context->texture an OBS-owned texture matching the mirror's size and
+// format family. Caller holds the graphics lock and context->mutex.
+static bool ensure_mirror_copy_locked(win_openvr *context, const D3D11_TEXTURE2D_DESC &desc)
+{
+	const gs_color_format format = vrcapture::GsFormatForSrgbContent(desc.Format);
+	if (format == GS_UNKNOWN) {
+		if (!context->logged_mirror_format) {
+			warn("SteamVR mirror texture format %d is not supported", static_cast<int>(desc.Format));
+			context->logged_mirror_format = true;
+		}
 		return false;
 	}
 
-	recalculate_crop_dimensions_locked(context);
-
-	context->texCrop.Reset();
-
-	HANDLE handle = nullptr;
-	ComPtr<IDXGIKeyedMutex> unusedMutex;
-	if (!vrcapture::CreateSharedD3D11Texture(context->shared_device.Get(), context->width, context->height,
-						  context->mirror_format, context->texCrop, unusedMutex, handle, false /* useKeyedMutex = false */)) {
-		warn("recreate_crop_texture: CreateSharedD3D11Texture failed");
-		return false;
+	if (context->texture && gs_texture_get_width(context->texture) == desc.Width &&
+	    gs_texture_get_height(context->texture) == desc.Height &&
+	    gs_texture_get_color_format(context->texture) == format) {
+		return true;
 	}
 
-	assert((reinterpret_cast<uintptr_t>(handle) >> 32) == 0 && "Win32 HANDLE unexpectedly exceeds 32 bits");
-	uint32_t GShandle = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(handle));
-	destroy_obs_texture(&context->texture);
-
-	obs_enter_graphics();
-	context->texture = gs_texture_open_shared(GShandle);
-	obs_leave_graphics();
-
+	if (context->texture) {
+		gs_texture_destroy(context->texture);
+	}
+	context->texture = gs_texture_create(desc.Width, desc.Height, format, 1, nullptr, 0);
+	context->lastFrame = 0; // force a copy into the new texture
 	if (!context->texture) {
-		warn("recreate_crop_texture: gs_texture_open_shared failed");
-		context->texCrop.Reset();
+		warn("gs_texture_create(%ux%u) for the SteamVR mirror copy failed", desc.Width, desc.Height);
 		return false;
 	}
-
 	return true;
 }
 
@@ -320,12 +341,26 @@ static void win_openvr_init(void *data, bool forced)
 		context->init_inprog.store(false);
 	};
 
+	GraphicsGuard graphics;
 	std::lock_guard<std::mutex> lock(context->mutex);
+
+	if (gs_get_device_type() != GS_DEVICE_DIRECT3D_11) {
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true)) {
+			warn("SteamVR capture requires OBS's Direct3D 11 renderer");
+		}
+		on_failure();
+		return;
+	}
 
 	{
 		std::lock_guard<std::mutex> global_lock(s_openvr_init_mutex);
 		const uint64_t generation = s_openvr_generation.load();
 		if (vr::VRSystem() == nullptr) {
+			if (!steamvr_server_running()) {
+				on_failure();
+				return;
+			}
 			vr::EVRInitError err = vr::VRInitError_None;
 			vr::VR_Init(&err, vr::VRApplication_Background);
 			if (err != vr::VRInitError_None) {
@@ -350,16 +385,6 @@ static void win_openvr_init(void *data, bool forced)
 		}
 	}
 
-	if (!context->shared_device) {
-		HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, context->shared_device.GetAddressOf(), nullptr, context->shared_context.GetAddressOf());
-		if (FAILED(hr)) {
-			warn("win_openvr_init: SHARED D3D11CreateDevice failed");
-			on_failure();
-			return;
-		}
-	}
-
-	context->texCrop.Reset();
 	release_mirror_texture_locked(context);
 
 	if (!vr::VRCompositor()) {
@@ -367,7 +392,11 @@ static void win_openvr_init(void *data, bool forced)
 		return;
 	}
 
-	vr::EVRCompositorError composError = vr::VRCompositor()->GetMirrorTextureD3D11(context->righteye ? vr::Eye_Right : vr::Eye_Left, context->shared_device.Get(), reinterpret_cast<void**>(&context->mirrorSrv));
+	// Open the mirror directly on OBS's device, so the per-frame copy and the
+	// draw happen on one device with no cross-device synchronization.
+	auto *obs_device = static_cast<ID3D11Device *>(gs_get_device_obj());
+	vr::EVRCompositorError composError = vr::VRCompositor()->GetMirrorTextureD3D11(
+		context->righteye ? vr::Eye_Right : vr::Eye_Left, obs_device, reinterpret_cast<void **>(&context->mirrorSrv));
 
 	if (composError != vr::VRCompositorError_None || !context->mirrorSrv) {
 		context->mirrorSrv = nullptr;
@@ -376,31 +405,24 @@ static void win_openvr_init(void *data, bool forced)
 	}
 
 	context->mirrorSrv->GetResource(context->tex.GetAddressOf());
-	if (!context->tex) {
-		warn("win_openvr_init: mirrorSrv->GetResource failed");
+	ComPtr<ID3D11Texture2D> tex2D;
+	if (!context->tex || FAILED(context->tex.As(&tex2D))) {
+		warn("win_openvr_init: mirror texture is not a Texture2D");
 		on_failure();
 		return;
 	}
 
 	D3D11_TEXTURE2D_DESC desc = {};
-	ComPtr<ID3D11Texture2D> tex2D = nullptr;
-	context->tex.As(&tex2D);
-	if (!tex2D) {
-		warn("win_openvr_init: tex->QueryInterface ID3D11Texture2D failed");
-		on_failure();
-		return;
-	}
-
 	tex2D->GetDesc(&desc);
 	context->device_width = desc.Width;
 	context->device_height = desc.Height;
 	context->mirror_format = desc.Format;
-	tex2D.Reset();
 
-	if (!recreate_crop_texture_locked(context)) {
+	if (!ensure_mirror_copy_locked(context, desc)) {
 		on_failure();
 		return;
 	}
+	recalculate_crop_dimensions_locked(context);
 
 	context->lastFrame = 0;
 	context->mirror_generation = s_openvr_mirror_generation.load();
@@ -434,15 +456,16 @@ static void win_openvr_deinit(void *data)
 	win_openvr *context = (win_openvr *)data;
 	if (!context) return;
 
+	GraphicsGuard graphics;
 	std::lock_guard<std::mutex> lock(context->mutex);
 
-	destroy_obs_texture(&context->texture);
-	if (context->texCrop) context->texCrop.Reset();
+	if (context->texture) {
+		gs_texture_destroy(context->texture);
+		context->texture = nullptr;
+	}
 	// Must precede VR_Shutdown below -- the compositor still has to be alive to
 	// take the mirror texture back.
 	release_mirror_texture_locked(context);
-	if (context->shared_device) context->shared_device.Reset();
-	if (context->shared_context) context->shared_context.Reset();
 
 	if (context->vr_initialized) {
 		context->vr_initialized = false;
@@ -480,8 +503,6 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 	std::lock_guard<std::mutex> lock(context->mutex);
 
 	bool old_righteye = context->righteye;
-	unsigned int old_width = context->width;
-	unsigned int old_height = context->height;
 
 	context->engine_mode = static_cast<CaptureEngineMode>(obs_data_get_int(settings, "engine_mode"));
 	context->righteye = obs_data_get_bool(settings, "righteye");
@@ -505,31 +526,21 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 		}
 	}
 
-	if (context->active_engine == CaptureEngineMode::OpenXR_VDXR) {
-		// OpenXR draws a sub-rectangle of the consumer's texture directly;
-		// no crop texture to rebuild, just the rectangle.
-		recalculate_crop_dimensions_locked(context);
-	} else if (context->initialized.load() && context->active_engine == CaptureEngineMode::OpenVR_SteamVR) {
-		if (old_righteye != context->righteye) {
-			// Eye changed: mirror texture must be re-queried for the other eye.
-			// Hand the old one back before dropping initialized, so the reinit
-			// below starts from a clean slate.
-			release_mirror_texture_locked(context);
-			context->initialized.store(false);
-			needs_reinit = true;
-		} else {
-			recalculate_crop_dimensions_locked(context);
-			// Only recreate texture if crop dimensions changed
-			if (old_width != context->width || old_height != context->height || !context->texture) {
-				recreate_crop_texture_locked(context);
-			}
-		}
+	// Both engines draw a sub-rectangle of a full-size texture, so a settings
+	// change only moves the rectangle -- no texture has to be rebuilt.
+	recalculate_crop_dimensions_locked(context);
+
+	if (context->initialized.load() && context->active_engine == CaptureEngineMode::OpenVR_SteamVR &&
+	    old_righteye != context->righteye) {
+		// Eye changed: the mirror texture must be re-queried for the other
+		// eye (win_openvr_init hands the old one back first).
+		needs_reinit = true;
 	}
 	} // context->mutex released here
 
 	if (context->engine_mode == CaptureEngineMode::OpenXR_VDXR) {
-		// Switched to OpenXR-only: release the SteamVR mirror, D3D device and
-		// runtime reference instead of keeping them alive unused.
+		// Switched to OpenXR-only: release the SteamVR mirror, its copy
+		// texture and the runtime reference instead of keeping them alive unused.
 		if (context->vr_initialized.load() || context->initialized.load()) {
 			win_openvr_deinit(data);
 		}
@@ -577,8 +588,10 @@ static void win_openvr_show(void *data)
 	context->active.store(true);
 	publish_openxr_interest(context);
 
+	// Don't initialize here: show() can run on the UI thread. Ask the next
+	// tick (graphics thread) to try right away, bypassing the backoff.
 	if (context->engine_mode != CaptureEngineMode::OpenXR_VDXR && !context->initialized.load()) {
-		win_openvr_init1(data, true); // forced
+		context->init_requested.store(true);
 	}
 }
 
@@ -649,13 +662,12 @@ static void win_openvr_render(void *data, gs_effect_t *effect)
 	if (context->engine_mode == CaptureEngineMode::OpenXR_VDXR) {
 		return;
 	}
+	// Initialization is tick()'s job; render only draws.
 	if (!context->initialized.load()) {
-		win_openvr_init1(data);
-		if (!context->initialized.load()) {
-			return;
-		}
+		return;
 	}
 
+	uint32_t x, y, cx, cy;
 	{
 		std::lock_guard<std::mutex> lock(context->mutex);
 
@@ -668,54 +680,47 @@ static void win_openvr_render(void *data, gs_effect_t *effect)
 				? vr::VRCompositor()
 				: nullptr;
 
-		// Verify mirror texture dimensions have not changed underneath us
-		ComPtr<ID3D11Texture2D> tex2D;
-		if (context->tex && SUCCEEDED(context->tex.As(&tex2D))) {
-			D3D11_TEXTURE2D_DESC srcDesc = {};
-			tex2D->GetDesc(&srcDesc);
-			if (srcDesc.Width != context->device_width || srcDesc.Height != context->device_height || srcDesc.Format != context->mirror_format) {
-				context->device_width = srcDesc.Width;
-				context->device_height = srcDesc.Height;
-				context->mirror_format = srcDesc.Format;
-				recalculate_crop_dimensions_locked(context);
-				recreate_crop_texture_locked(context);
-			}
+		ComPtr<ID3D11Texture2D> mirror;
+		if (!compositor || !context->tex || FAILED(context->tex.As(&mirror))) {
+			return;
+		}
+
+		// Follow mirror size/format changes (e.g. render resolution changed).
+		D3D11_TEXTURE2D_DESC desc = {};
+		mirror->GetDesc(&desc);
+		if (desc.Width != context->device_width || desc.Height != context->device_height ||
+		    desc.Format != context->mirror_format) {
+			context->device_width = desc.Width;
+			context->device_height = desc.Height;
+			context->mirror_format = desc.Format;
+			recalculate_crop_dimensions_locked(context);
+		}
+		if (!ensure_mirror_copy_locked(context, desc)) {
+			return;
 		}
 
 		vr::Compositor_FrameTiming frameTiming = {};
 		frameTiming.m_nSize = sizeof(vr::Compositor_FrameTiming);
-		if (compositor && compositor->GetFrameTiming(&frameTiming, 0)) {
-			if (frameTiming.m_nFrameIndex != context->lastFrame) {
-				if (context->texCrop && context->tex && context->shared_context) {
-					UINT cropX = (context->x < context->device_width) ? context->x : 0;
-					UINT cropY = (context->y < context->device_height) ? context->y : 0;
-					UINT cropRight = std::min(cropX + context->width, context->device_width);
-					UINT cropBottom = std::min(cropY + context->height, context->device_height);
-
-					if (cropRight > cropX && cropBottom > cropY) {
-						D3D11_BOX poksi = {
-							cropX,
-							cropY,
-							0,
-							cropRight,
-							cropBottom,
-							1
-						};
-
-						context->shared_context->CopySubresourceRegion(context->texCrop.Get(), 0, 0, 0, 0, context->tex.Get(), 0, &poksi);
-						context->shared_context->Flush();
-						context->lastFrame = frameTiming.m_nFrameIndex;
-					}
-				}
+		if (compositor->GetFrameTiming(&frameTiming, 0) && frameTiming.m_nFrameIndex != context->lastFrame) {
+			// Same device as the mirror, so this is an ordinary GPU copy on
+			// OBS's own context (we're on the graphics thread, inside OBS's
+			// graphics lock); it's ordered before the draw below.
+			auto *dst = static_cast<ID3D11Texture2D *>(gs_texture_get_obj(context->texture));
+			ComPtr<ID3D11DeviceContext> obs_context;
+			static_cast<ID3D11Device *>(gs_get_device_obj())->GetImmediateContext(obs_context.GetAddressOf());
+			if (dst && obs_context) {
+				obs_context->CopySubresourceRegion(dst, 0, 0, 0, 0, mirror.Get(), 0, nullptr);
+				context->lastFrame = frameTiming.m_nFrameIndex;
 			}
 		}
+
+		x = context->x;
+		y = context->y;
+		cx = context->width;
+		cy = context->height;
 	}
 
-	if (context->texture) {
-		while (gs_effect_loop(effect, "Draw")) {
-			obs_source_draw(context->texture, 0, 0, 0, 0, false);
-		}
-	}
+	vrcapture::DrawTextureRegion(effect, context->texture, x, y, cx, cy);
 }
 
 static void win_openvr_tick(void *data, float seconds)
@@ -803,7 +808,7 @@ static void win_openvr_tick(void *data, float seconds)
 	// Initialize OpenVR if needed
 	if (context->active_engine == CaptureEngineMode::OpenVR_SteamVR) {
 		if (!context->initialized.load() && context->active.load()) {
-			win_openvr_init1(data);
+			win_openvr_init1(data, context->init_requested.exchange(false));
 		}
 	}
 }
@@ -878,7 +883,7 @@ bool obs_module_load(void)
 	obs_source_info info = {};
 	info.id = "openvr_capture";
 	info.type = OBS_SOURCE_TYPE_INPUT;
-	info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW;
+	info.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW | OBS_SOURCE_SRGB;
 	info.get_name = win_openvr_get_name;
 	info.create = win_openvr_create;
 	info.destroy = win_openvr_destroy;

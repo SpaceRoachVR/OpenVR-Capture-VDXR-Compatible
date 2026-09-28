@@ -1,4 +1,5 @@
 #include "openxr_ipc_consumer.h"
+#include "obs_draw_util.h"
 #include <algorithm>
 
 namespace vrcapture {
@@ -388,17 +389,10 @@ bool OpenXrIpcConsumer::Render(VREyeSelection eyeSel, gs_effect_t *effect, uint3
         return false;
     }
 
-    // Clamp the crop to the texture; a 0 extent means "to the edge".
-    x = (std::min)(x, eye->width - 1);
-    y = (std::min)(y, eye->height - 1);
-    cx = (cx == 0 || x + cx > eye->width) ? eye->width - x : cx;
-    cy = (cy == 0 || y + cy > eye->height) ? eye->height - y : cy;
-
-    gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
-    gs_effect_set_texture(image, eye->privateTexture);
-    while (gs_effect_loop(effect, "Draw")) {
-        gs_draw_sprite_subregion(eye->privateTexture, 0, x, y, cx, cy);
-    }
+    // The private copy keeps the producer's gs format, so sRGB swapchains are
+    // decoded as sRGB and UNORM/float swapchains (linear per the OpenXR spec)
+    // are sampled as linear.
+    DrawTextureRegion(effect, eye->privateTexture, x, y, cx, cy);
     return true;
 }
 

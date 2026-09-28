@@ -27,7 +27,13 @@
 | B3: per-eye textures + eye mask (IPC v3); one shared consumer per OBS process; hiding one source no longer disconnects others | ✅ done, covered by `tests/ipc_handshake_test` |
 | C2: failed mirror refresh clears `initialized` (no frozen frame, no per-frame forced retries) | ✅ done (code review only) |
 | C5: forced-OpenXR mode never draws the SteamVR mirror and releases OpenVR resources | ✅ done (code review only) |
+| C4: SteamVR mirror opened on OBS's device, copied with OBS's context into an owned texture; crop drawn as a sub-rectangle (private device, shared crop texture and `Flush()` removed) | ✅ done (needs SteamVR test) |
+| C3 (reduced scope): no VR init from `video_render` or `show()`; idle retry checks for `vrserver.exe` before `VR_Init` | ✅ done; the one-time `VR_Init` connect still runs on the graphics thread (see note below) |
+| C6: `OBS_SOURCE_SRGB` + per-format sRGB/linear sampling for both engines | ✅ done (needs visual check vs headset) |
+| C7: lock order is now uniformly graphics → `context->mutex`; `update()` does no texture work | ✅ done as part of C4 |
 | Everything else | open |
+
+**C3 note:** fully moving `VR_Init` to a worker thread was deliberately not done. OpenVR's `VRSystem()` is used unguarded from the tick (event polling), so a worker calling `VR_Init`/`VR_Shutdown` concurrently needs a broader locking redesign that can't be verified without SteamVR. What remains is a single connect call when SteamVR starts; the recurring cost while SteamVR is down is gone.
 
 ---
 
