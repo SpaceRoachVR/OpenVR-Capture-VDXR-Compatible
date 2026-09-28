@@ -27,3 +27,17 @@ target_link_options(ipc_handshake_test PRIVATE /DELAYLOAD:obs.dll)
 
 enable_testing()
 add_test(NAME ipc_handshake COMMAND ipc_handshake_test)
+
+# Manual tool, not a ctest: impersonates an OpenXR game for testing OBS
+# without a headset. See the header comment in fake_producer.cpp.
+add_executable(fake_producer
+	fake_producer.cpp
+	${ROOT}/layers/openxr-vrcapture-layer/layer_ipc_producer.cpp
+)
+target_compile_features(fake_producer PRIVATE cxx_std_17)
+target_compile_definitions(fake_producer PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(fake_producer PRIVATE
+	${ROOT}/layers/openxr-vrcapture-layer
+	${ROOT}/shared
+)
+target_link_libraries(fake_producer PRIVATE d3d11 dxgi)

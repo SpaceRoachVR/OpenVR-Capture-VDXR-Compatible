@@ -58,3 +58,12 @@ A fork of OBS-OpenVR-Input-Plugin, originally made by Keijo "Kegetys" Ruotsalain
    cmake --build build/layers --config Release
    ```
 2. Register the compiled layer with `scripts/Install-OpenXR-Layer.ps1`.
+
+#### 3. Tests & headset-free testing
+```bash
+cmake -B build/tests -S tests
+cmake --build build/tests --config Release
+ctest --test-dir build/tests -C Release
+```
+- `ipc_handshake_test` exercises the OBS <-> layer shared-memory protocol and keyed-mutex frame handoff (no OBS or headset needed).
+- `fake_producer [fps] [width] [height]` impersonates an OpenXR game: with OBS running and a VR Capture source visible (engine Auto or VDXR/OpenXR), it streams an animated test pattern through the real IPC path.

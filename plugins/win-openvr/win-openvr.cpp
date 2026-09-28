@@ -467,7 +467,11 @@ static void win_openvr_update(void *data, obs_data_t *settings)
 		}
 	}
 
-	if (context->initialized.load() && context->active_engine == CaptureEngineMode::OpenVR_SteamVR) {
+	if (context->active_engine == CaptureEngineMode::OpenXR_VDXR) {
+		// OpenXR draws a sub-rectangle of the consumer's texture directly;
+		// no crop texture to rebuild, just the rectangle.
+		recalculate_crop_dimensions_locked(context);
+	} else if (context->initialized.load() && context->active_engine == CaptureEngineMode::OpenVR_SteamVR) {
 		if (old_righteye != context->righteye) {
 			// Eye changed: mirror texture must be re-queried for the other eye.
 			// Hand the old one back before dropping initialized, so the reinit
@@ -581,11 +585,19 @@ static void win_openvr_render(void *data, gs_effect_t *effect)
 
 	effect = obs_get_base_effect(OBS_EFFECT_OPAQUE);
 
-	// Backend 1: OpenXR / VDXR Render Path
-	if (context->active_engine == CaptureEngineMode::OpenXR_VDXR && context->openxr_consumer) {
-		gs_texture_t *openxr_tex = context->openxr_consumer->GetTexture();
-		if (openxr_tex) {
-			context->openxr_consumer->Render(effect);
+	// Backend 1: OpenXR / VDXR Render Path. Same crop/zoom/offset rectangle
+	// as the OpenVR path; tick() keeps it in sync with the frame size.
+	if (context->active_engine == CaptureEngineMode::OpenXR_VDXR && context->openxr_consumer &&
+	    context->openxr_consumer->GetTexture()) {
+		uint32_t x, y, cx, cy;
+		{
+			std::lock_guard<std::mutex> lock(context->mutex);
+			x = context->x;
+			y = context->y;
+			cx = context->width;
+			cy = context->height;
+		}
+		if (context->openxr_consumer->Render(effect, x, y, cx, cy)) {
 			return;
 		}
 	}
@@ -690,10 +702,14 @@ static void win_openvr_tick(void *data, float seconds)
 	if (context->active_engine == CaptureEngineMode::OpenXR_VDXR && context->openxr_consumer && context->active.load()) {
 		vrcapture::VREyeSelection eye = context->righteye ? vrcapture::VREyeSelection::Right : vrcapture::VREyeSelection::Left;
 		if (context->openxr_consumer->UpdateTexture(eye)) {
+			const uint32_t w = context->openxr_consumer->GetWidth();
+			const uint32_t h = context->openxr_consumer->GetHeight();
 			std::lock_guard<std::mutex> lock(context->mutex);
-			context->device_width = context->openxr_consumer->GetWidth();
-			context->device_height = context->openxr_consumer->GetHeight();
-			recalculate_crop_dimensions_locked(context);
+			if (context->device_width != w || context->device_height != h) {
+				context->device_width = w;
+				context->device_height = h;
+				recalculate_crop_dimensions_locked(context);
+			}
 		}
 	}
 

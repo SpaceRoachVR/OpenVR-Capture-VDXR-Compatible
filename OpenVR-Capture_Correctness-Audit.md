@@ -19,6 +19,10 @@
 | (new) consumer re-locked its own non-recursive mutex in `UpdateTexture` → `Initialize` | ✅ fixed with A3 |
 | B4 / B5: consumer mapping retry throttle, locked header access | ✅ done with A3 |
 | SteamVR-only sources no longer touch the OpenXR IPC (part of B3) | ✅ done with A3 |
+| A4: producer copy atomic with texture swap; resize-pending frames dropped | ✅ done, covered by `tests/ipc_handshake_test` |
+| A5 (partial): correct subresource index, MSAA + out-of-bounds rects skipped | ✅ done (copy still happens in `xrEndFrame`) |
+| B1: consumer copies into an OBS-owned texture once per tick, always draws it | ✅ done, verify with `tests/fake_producer` |
+| B2: zoom / aspect / offsets applied to the OpenXR draw | ✅ done, verify with `tests/fake_producer` |
 | Everything else | open |
 
 ---
