@@ -137,44 +137,68 @@ bool LayerIpcProducer::TryAttach()
 
 bool LayerIpcProducer::Initialize(ID3D11Device *device, uint32_t width, uint32_t height, DXGI_FORMAT format, bool is_d3d12)
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!device || width == 0 || height == 0) {
+        return false;
+    }
+    if (format == DXGI_FORMAT_UNKNOWN) {
+        format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
 
-    if (!device || width == 0 || height == 0 || !m_sharedHeader) {
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_sharedHeader) {
+            return false;
+        }
+        m_isD3D12 = is_d3d12;
+        m_sharedHeader->is_d3d12 = is_d3d12 ? 1 : 0;
+        if (m_sharedTexture && m_width == width && m_height == height && m_format == format) {
+            return true; // Already matching
+        }
+    }
+
+    // Build the replacement outside the lock (ID3D11Device is free-threaded),
+    // so the app's xrEndFrame never waits on CreateTexture2D.
+    ComPtr<ID3D11Texture2D> texture;
+    ComPtr<IDXGIKeyedMutex> keyedMutex;
+    HANDLE sharedHandle = nullptr;
+    if (!CreateSharedD3D11Texture(device, width, height, format, texture, keyedMutex, sharedHandle)) {
         return false;
     }
 
-    m_device = device;
-    m_isD3D12 = is_d3d12;
-    m_sharedHeader->is_d3d12 = is_d3d12 ? 1 : 0;
-
-    return CreateSharedTexture(device, width, height, format);
-}
-
-bool LayerIpcProducer::CreateSharedTexture(ID3D11Device *device, uint32_t width, uint32_t height, DXGI_FORMAT format)
-{
-    if (m_sharedTexture && m_width == width && m_height == height && m_format == format) {
-        return true; // Already matching
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_sharedHeader) {
+        return false; // Shutdown raced us
     }
 
-    DestroySharedTexture();
-
+    // Swap atomically with respect to CopyFrame(); the old texture is
+    // released when `texture` goes out of scope after the swap.
+    m_device = device;
+    m_sharedTexture.Swap(texture);
+    m_keyedMutex.Swap(keyedMutex);
+    m_sharedHandle = sharedHandle;
     m_width = width;
     m_height = height;
-    m_format = (format != DXGI_FORMAT_UNKNOWN) ? format : DXGI_FORMAT_R8G8B8A8_UNORM;
+    m_format = format;
 
-    if (!CreateSharedD3D11Texture(device, m_width, m_height, m_format, m_sharedTexture, m_keyedMutex, m_sharedHandle)) {
-        return false;
-    }
-
-    // Publish texture handle to shared memory
-    if (m_sharedHeader) {
-        m_sharedHeader->shared_handle = reinterpret_cast<uint64_t>(m_sharedHandle);
-        m_sharedHeader->texture_width = m_width;
-        m_sharedHeader->texture_height = m_height;
-        m_sharedHeader->dxgi_format = static_cast<uint32_t>(m_format);
-    }
+    // Publish under the seqlock so a reader never pairs a new handle with
+    // old dimensions.
+    InterlockedIncrement(&m_sharedHeader->seq);
+    m_sharedHeader->shared_handle = reinterpret_cast<uint64_t>(m_sharedHandle);
+    m_sharedHeader->texture_width = m_width;
+    m_sharedHeader->texture_height = m_height;
+    m_sharedHeader->dxgi_format = static_cast<uint32_t>(m_format);
+    InterlockedIncrement(&m_sharedHeader->seq);
 
     return true;
+}
+
+bool LayerIpcProducer::HasTexture(uint32_t width, uint32_t height, DXGI_FORMAT format) const
+{
+    if (format == DXGI_FORMAT_UNKNOWN) {
+        format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_sharedTexture && m_width == width && m_height == height && m_format == format;
 }
 
 void LayerIpcProducer::DestroySharedTexture()
@@ -182,6 +206,9 @@ void LayerIpcProducer::DestroySharedTexture()
     m_keyedMutex.Reset();
     m_sharedTexture.Reset();
     m_sharedHandle = nullptr;
+    m_width = 0;
+    m_height = 0;
+    m_format = DXGI_FORMAT_UNKNOWN;
 }
 
 void LayerIpcProducer::Shutdown()
@@ -231,71 +258,74 @@ VREyeSelection LayerIpcProducer::GetRequestedEye()
     return static_cast<VREyeSelection>(m_sharedHeader->requested_eye);
 }
 
-bool LayerIpcProducer::BeginFrameCopy(ID3D11DeviceContext *context)
+bool LayerIpcProducer::CopyFrame(ID3D11DeviceContext *context, ID3D11Texture2D *source, UINT sourceSubresource,
+                                 const D3D11_BOX &box, int64_t display_time_ns, const float fov[4],
+                                 const float orientation[4], const float position[3])
 {
-    (void)context;
+    if (!context || !source || box.right <= box.left || box.bottom <= box.top) {
+        return false;
+    }
+
+    // Held across acquire -> copy -> release -> publish so the worker can't
+    // swap the texture out from under us mid-copy. CopySubresourceRegion only
+    // records a command, so this is a short hold.
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    if (!m_sharedTexture) return false;
+    if (!m_sharedTexture || !m_sharedHeader) {
+        return false;
+    }
+
+    // A resize is pending on the worker; don't write a box that doesn't fit.
+    if (box.right - box.left != m_width || box.bottom - box.top != m_height) {
+        return false;
+    }
 
     if (m_keyedMutex) {
-        // Non-blocking try to acquire key 0 (released by OBS consumer)
-        HRESULT hr = m_keyedMutex->AcquireSync(0, 0);
-        if (hr == S_OK) {
-            m_hasAcquiredLock = true;
-            return true;
-        } else {
-            m_hasAcquiredLock = false;
-            return false; // OBS is currently reading or busy
+        // Non-blocking: key 0 is handed back by OBS once it has copied the
+        // previous frame out. If it hasn't yet, drop this frame.
+        if (m_keyedMutex->AcquireSync(0, 0) != S_OK) {
+            return false;
         }
     }
 
-    m_hasAcquiredLock = true;
-    return true;
-}
+    context->CopySubresourceRegion(m_sharedTexture.Get(), 0, 0, 0, 0, source, sourceSubresource, &box);
 
-void LayerIpcProducer::EndFrameCopy(int64_t display_time_ns, const float fov[4], const float orientation[4], const float position[3])
-{
-    std::lock_guard<std::mutex> lock(m_mutex);
-
-    if (m_keyedMutex && m_hasAcquiredLock) {
-        m_keyedMutex->ReleaseSync(1); // Release key 1 for OBS consumer
+    if (m_keyedMutex) {
+        m_keyedMutex->ReleaseSync(1); // Hand key 1 to the OBS consumer
     }
-    m_hasAcquiredLock = false;
 
     m_frameIndex++;
 
-    if (m_sharedHeader) {
-        // Seqlock: odd = write in progress. Cross-process readers spin/retry
-        // rather than ever observing a torn mix of these fields.
-        InterlockedIncrement(&m_sharedHeader->seq);
+    // Seqlock: odd = write in progress. Cross-process readers spin/retry
+    // rather than ever observing a torn mix of these fields.
+    InterlockedIncrement(&m_sharedHeader->seq);
 
-        m_sharedHeader->frame_index = m_frameIndex;
-        m_sharedHeader->display_time_ns = display_time_ns;
-        m_sharedHeader->last_producer_heartbeat = GetTickCount64();
+    m_sharedHeader->frame_index = m_frameIndex;
+    m_sharedHeader->display_time_ns = display_time_ns;
+    m_sharedHeader->last_producer_heartbeat = GetTickCount64();
 
-        if (fov) {
-            m_sharedHeader->fov_left = fov[0];
-            m_sharedHeader->fov_right = fov[1];
-            m_sharedHeader->fov_up = fov[2];
-            m_sharedHeader->fov_down = fov[3];
-        }
-
-        if (orientation) {
-            m_sharedHeader->pose_orientation[0] = orientation[0];
-            m_sharedHeader->pose_orientation[1] = orientation[1];
-            m_sharedHeader->pose_orientation[2] = orientation[2];
-            m_sharedHeader->pose_orientation[3] = orientation[3];
-        }
-
-        if (position) {
-            m_sharedHeader->pose_position[0] = position[0];
-            m_sharedHeader->pose_position[1] = position[1];
-            m_sharedHeader->pose_position[2] = position[2];
-        }
-
-        InterlockedIncrement(&m_sharedHeader->seq); // back to even: stable
+    if (fov) {
+        m_sharedHeader->fov_left = fov[0];
+        m_sharedHeader->fov_right = fov[1];
+        m_sharedHeader->fov_up = fov[2];
+        m_sharedHeader->fov_down = fov[3];
     }
+
+    if (orientation) {
+        m_sharedHeader->pose_orientation[0] = orientation[0];
+        m_sharedHeader->pose_orientation[1] = orientation[1];
+        m_sharedHeader->pose_orientation[2] = orientation[2];
+        m_sharedHeader->pose_orientation[3] = orientation[3];
+    }
+
+    if (position) {
+        m_sharedHeader->pose_position[0] = position[0];
+        m_sharedHeader->pose_position[1] = position[1];
+        m_sharedHeader->pose_position[2] = position[2];
+    }
+
+    InterlockedIncrement(&m_sharedHeader->seq); // back to even: stable
+    return true;
 }
 
 } // namespace vrcapture

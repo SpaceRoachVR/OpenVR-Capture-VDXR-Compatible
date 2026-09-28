@@ -96,7 +96,9 @@ XrResult OpenXRInterceptor::xrCreateSwapchain(XrSession session, const XrSwapcha
         SwapchainInfo info = {};
         info.width = createInfo->width;
         info.height = createInfo->height;
-        info.arraySize = createInfo->arraySize;
+        info.arraySize = createInfo->arraySize > 0 ? createInfo->arraySize : 1;
+        info.mipCount = createInfo->mipCount > 0 ? createInfo->mipCount : 1;
+        info.sampleCount = createInfo->sampleCount;
         info.format = static_cast<DXGI_FORMAT>(createInfo->format);
         m_swapchains[*swapchain] = info;
     }
@@ -220,85 +222,74 @@ XrResult OpenXRInterceptor::xrEndFrame(XrSession session, const XrFrameEndInfo *
                     // would stall the per-frame Acquire/Release hooks on the
                     // app's render thread and cost frame time in the headset.
                     ComPtr<ID3D11Texture2D> srcTexRef;
-                    uint32_t swapWidth = 0, swapHeight = 0;
+                    uint32_t swapWidth = 0, swapHeight = 0, swapMips = 1, swapArraySize = 1;
                     DXGI_FORMAT swapFormat = DXGI_FORMAT_UNKNOWN;
                     {
                         std::lock_guard<std::mutex> lock(m_swapchainMutex);
                         auto it = m_swapchains.find(swapchain);
-                        if (it != m_swapchains.end() && !it->second.d3d11_textures.empty()) {
+                        if (it != m_swapchains.end() && !it->second.d3d11_textures.empty() &&
+                            it->second.sampleCount <= 1) {
                             // Use the image actually submitted this frame (tracked via
                             // xrAcquireSwapchainImage/xrReleaseSwapchainImage), not a
                             // fixed slot -- swapchains are multi-buffered, so a fixed
                             // index would frequently capture a stale/wrong buffer.
+                            // MSAA swapchains are skipped: CopySubresourceRegion
+                            // can't read them (they'd need a resolve).
                             uint32_t imageIndex = it->second.currentImageIndex;
                             if (imageIndex < it->second.d3d11_textures.size()) {
                                 srcTexRef = it->second.d3d11_textures[imageIndex];
                                 swapWidth = it->second.width;
                                 swapHeight = it->second.height;
+                                swapMips = it->second.mipCount;
+                                swapArraySize = it->second.arraySize;
                                 swapFormat = it->second.format;
                             }
                         }
                     }
 
-                    {
-                        {
-                            ID3D11Texture2D *srcTex = srcTexRef.Get();
-                            if (srcTex) {
-                                uint32_t cropWidth = view.subImage.imageRect.extent.width;
-                                uint32_t cropHeight = view.subImage.imageRect.extent.height;
-                                if (cropWidth == 0) cropWidth = swapWidth;
-                                if (cropHeight == 0) cropHeight = swapHeight;
+                    const XrRect2Di &rect = view.subImage.imageRect;
+                    int64_t cropX = rect.offset.x;
+                    int64_t cropY = rect.offset.y;
+                    int64_t cropWidth = rect.extent.width > 0 ? rect.extent.width : swapWidth;
+                    int64_t cropHeight = rect.extent.height > 0 ? rect.extent.height : swapHeight;
 
-                                if (m_ipc.GetWidth() != cropWidth || m_ipc.GetHeight() != cropHeight || !m_ipc.GetSharedTexture()) {
-                                    // Non-blocking: hands resource (re)creation to a
-                                    // background worker instead of stalling this
-                                    // latency-sensitive frame-submission call.
-                                    m_ipc.RequestAsyncInitialize(m_d3d11Device.Get(), cropWidth, cropHeight, swapFormat, false);
-                                }
+                    // The rect comes from the app; never let it drive an
+                    // out-of-bounds copy.
+                    const bool rectValid = cropX >= 0 && cropY >= 0 && cropWidth > 0 && cropHeight > 0 &&
+                                           cropX + cropWidth <= swapWidth && cropY + cropHeight <= swapHeight &&
+                                           arrayIndex < swapArraySize;
 
-                                if (m_ipc.BeginFrameCopy(m_d3d11Context.Get())) {
-                                    D3D11_BOX box = {};
-                                    box.left = static_cast<UINT>(view.subImage.imageRect.offset.x);
-                                    box.top = static_cast<UINT>(view.subImage.imageRect.offset.y);
-                                    box.front = 0;
-                                    box.right = static_cast<UINT>(box.left + cropWidth);
-                                    box.bottom = static_cast<UINT>(box.top + cropHeight);
-                                    box.back = 1;
+                    if (srcTexRef && rectValid) {
+                        const uint32_t w = static_cast<uint32_t>(cropWidth);
+                        const uint32_t h = static_cast<uint32_t>(cropHeight);
 
-                                    m_d3d11Context->CopySubresourceRegion(
-                                        m_ipc.GetSharedTexture(),
-                                        0,
-                                        0,
-                                        0,
-                                        0,
-                                        srcTex,
-                                        arrayIndex,
-                                        &box);
-
-                                    float fov[4] = {
-                                        view.fov.angleLeft,
-                                        view.fov.angleRight,
-                                        view.fov.angleUp,
-                                        view.fov.angleDown
-                                    };
-
-                                    float orientation[4] = {
-                                        view.pose.orientation.x,
-                                        view.pose.orientation.y,
-                                        view.pose.orientation.z,
-                                        view.pose.orientation.w
-                                    };
-
-                                    float position[3] = {
-                                        view.pose.position.x,
-                                        view.pose.position.y,
-                                        view.pose.position.z
-                                    };
-
-                                    m_ipc.EndFrameCopy(frameEndInfo->displayTime, fov, orientation, position);
-                                }
-                            }
+                        if (!m_ipc.HasTexture(w, h, swapFormat)) {
+                            // Non-blocking: hands resource (re)creation to a
+                            // background worker instead of stalling this
+                            // latency-sensitive frame-submission call. Until
+                            // it lands, CopyFrame drops frames whose size
+                            // doesn't match.
+                            m_ipc.RequestAsyncInitialize(m_d3d11Device.Get(), w, h, swapFormat, false);
                         }
+
+                        D3D11_BOX box = {};
+                        box.left = static_cast<UINT>(cropX);
+                        box.top = static_cast<UINT>(cropY);
+                        box.front = 0;
+                        box.right = static_cast<UINT>(cropX + cropWidth);
+                        box.bottom = static_cast<UINT>(cropY + cropHeight);
+                        box.back = 1;
+
+                        const float fov[4] = {view.fov.angleLeft, view.fov.angleRight, view.fov.angleUp,
+                                              view.fov.angleDown};
+                        const float orientation[4] = {view.pose.orientation.x, view.pose.orientation.y,
+                                                      view.pose.orientation.z, view.pose.orientation.w};
+                        const float position[3] = {view.pose.position.x, view.pose.position.y,
+                                                   view.pose.position.z};
+
+                        m_ipc.CopyFrame(m_d3d11Context.Get(), srcTexRef.Get(),
+                                        D3D11CalcSubresource(0, arrayIndex, swapMips), box,
+                                        frameEndInfo->displayTime, fov, orientation, position);
                     }
                 }
                 break; // Handled projection layer

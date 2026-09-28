@@ -40,23 +40,18 @@ public:
     bool IsObsConnected();
     VREyeSelection GetRequestedEye();
 
-    // Call before copying to shared texture
-    bool BeginFrameCopy(ID3D11DeviceContext *context);
+    // True if the published texture already matches these parameters.
+    bool HasTexture(uint32_t width, uint32_t height, DXGI_FORMAT format) const;
 
-    // Call after copying to shared texture to release key 1 and update metadata
-    void EndFrameCopy(int64_t display_time_ns, const float fov[4], const float orientation[4], const float position[3]);
-
-    ID3D11Texture2D *GetSharedTexture() const
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_sharedTexture.Get();
-    }
-    uint32_t GetWidth() const { return m_width; }
-    uint32_t GetHeight() const { return m_height; }
-    DXGI_FORMAT GetFormat() const { return m_format; }
+    // Copies `box` of source[sourceSubresource] into the shared texture and
+    // publishes frame metadata, as one atomic step with respect to texture
+    // (re)creation. Returns false (frame dropped) if there is no texture yet,
+    // a resize is still pending, or OBS hasn't released the previous frame.
+    bool CopyFrame(ID3D11DeviceContext *context, ID3D11Texture2D *source, UINT sourceSubresource,
+                   const D3D11_BOX &box, int64_t display_time_ns, const float fov[4],
+                   const float orientation[4], const float position[3]);
 
 private:
-    bool CreateSharedTexture(ID3D11Device *device, uint32_t width, uint32_t height, DXGI_FORMAT format);
     void DestroySharedTexture();
     void InitWorkerLoop();
 
@@ -81,7 +76,6 @@ private:
     bool m_isD3D12 = false;
 
     uint64_t m_frameIndex = 0;
-    bool m_hasAcquiredLock = false;
 
     // Background init worker (see RequestAsyncInitialize)
     std::thread m_initWorker;

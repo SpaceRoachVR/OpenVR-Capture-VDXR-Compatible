@@ -22,6 +22,8 @@ struct SwapchainInfo {
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t arraySize = 1;
+    uint32_t mipCount = 1;
+    uint32_t sampleCount = 1;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
     std::vector<ComPtr<ID3D11Texture2D>> d3d11_textures;
 
