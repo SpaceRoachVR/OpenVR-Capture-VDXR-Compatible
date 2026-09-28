@@ -17,6 +17,14 @@ target_include_directories(openxr-vrcapture-layer PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../shared
 )
 
+# Required by the official openxr_platform.h to expose the D3D11 binding types.
+target_compile_definitions(openxr-vrcapture-layer PRIVATE
+    XR_USE_PLATFORM_WIN32
+    XR_USE_GRAPHICS_API_D3D11
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+)
+
 target_link_libraries(openxr-vrcapture-layer PRIVATE
     d3d11
     dxgi

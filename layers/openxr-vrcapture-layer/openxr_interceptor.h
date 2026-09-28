@@ -1,5 +1,10 @@
 #pragma once
 
+// The official openxr_platform.h does not include the platform/graphics headers
+// itself; they must precede it (XR_USE_* are defined in CMakeLists.txt).
+#include <windows.h>
+#include <unknwn.h>
+#include <d3d11.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <openxr/openxr_loader_negotiation.h>

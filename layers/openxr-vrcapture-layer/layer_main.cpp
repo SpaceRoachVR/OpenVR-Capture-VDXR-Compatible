@@ -37,18 +37,33 @@ static XrResult XRAPI_CALL Hook_xrCreateApiLayerInstance(
     const struct XrApiLayerCreateInfo *layerInfo,
     XrInstance *instance)
 {
-    if (!layerInfo || !layerInfo->nextInfo) {
+    // Validate the loader-supplied structs before trusting any of their
+    // pointers: a layout mismatch here reads garbage and crashes the host app.
+    if (!layerInfo ||
+        layerInfo->structType != XR_LOADER_INTERFACE_STRUCT_API_LAYER_CREATE_INFO ||
+        layerInfo->structVersion != XR_API_LAYER_CREATE_INFO_STRUCT_VERSION ||
+        layerInfo->structSize != sizeof(XrApiLayerCreateInfo)) {
         return XR_ERROR_INITIALIZATION_FAILED;
     }
 
-    g_nextGetInstanceProcAddr = layerInfo->nextInfo->nextGetInstanceProcAddr;
-    g_nextCreateApiLayerInstance = reinterpret_cast<PFN_xrCreateApiLayerInstance>(layerInfo->nextInfo->nextCreateApiLayerInstance);
+    XrApiLayerNextInfo *nextInfo = layerInfo->nextInfo;
+    if (!nextInfo ||
+        nextInfo->structType != XR_LOADER_INTERFACE_STRUCT_API_LAYER_NEXT_INFO ||
+        nextInfo->structVersion != XR_API_LAYER_NEXT_INFO_STRUCT_VERSION ||
+        nextInfo->structSize != sizeof(XrApiLayerNextInfo) ||
+        !nextInfo->nextGetInstanceProcAddr ||
+        !nextInfo->nextCreateApiLayerInstance) {
+        return XR_ERROR_INITIALIZATION_FAILED;
+    }
+
+    g_nextGetInstanceProcAddr = nextInfo->nextGetInstanceProcAddr;
+    g_nextCreateApiLayerInstance = nextInfo->nextCreateApiLayerInstance;
 
     OpenXRInterceptor::Get().SetNextGetInstanceProcAddr(g_nextGetInstanceProcAddr);
 
     // Chain to next layer or runtime
     XrApiLayerCreateInfo nextLayerInfo = *layerInfo;
-    nextLayerInfo.nextInfo = const_cast<XrApiLayerNextInfo *>(reinterpret_cast<const XrApiLayerNextInfo *>(layerInfo->nextInfo->next));
+    nextLayerInfo.nextInfo = nextInfo->next;
 
     if (g_nextCreateApiLayerInstance) {
         XrResult result = g_nextCreateApiLayerInstance(info, &nextLayerInfo, instance);
@@ -73,13 +88,13 @@ extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderApiLayerIn
     }
 
     if (loaderInfo->structType != XR_LOADER_INTERFACE_STRUCT_LOADER_INFO ||
-        loaderInfo->structVersion != 1 ||
+        loaderInfo->structVersion != XR_LOADER_INFO_STRUCT_VERSION ||
         loaderInfo->structSize != sizeof(XrNegotiateLoaderInfo)) {
         return XR_ERROR_INITIALIZATION_FAILED;
     }
 
     if (apiLayerRequest->structType != XR_LOADER_INTERFACE_STRUCT_API_LAYER_REQUEST ||
-        apiLayerRequest->structVersion != 1 ||
+        apiLayerRequest->structVersion != XR_API_LAYER_INFO_STRUCT_VERSION ||
         apiLayerRequest->structSize != sizeof(XrNegotiateApiLayerRequest)) {
         return XR_ERROR_INITIALIZATION_FAILED;
     }
@@ -92,7 +107,7 @@ extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderApiLayerIn
     apiLayerRequest->layerInterfaceVersion = XR_CURRENT_LOADER_API_LAYER_VERSION;
     apiLayerRequest->layerApiVersion = XR_CURRENT_API_VERSION;
     apiLayerRequest->getInstanceProcAddr = Hook_xrGetInstanceProcAddr;
-    apiLayerRequest->createApiLayerInstance = reinterpret_cast<PFN_xrVoidFunction>(Hook_xrCreateApiLayerInstance);
+    apiLayerRequest->createApiLayerInstance = Hook_xrCreateApiLayerInstance;
 
     return XR_SUCCESS;
 }
