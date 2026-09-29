@@ -44,6 +44,21 @@
 
 ---
 
+## Field testing (2026-09-28/29)
+
+Found by running the real plugin in OBS 32.2.2 (run as administrator) and POPULATION ONE (Unity + Meta OVRPlugin, D3D11, `R8G8B8A8_UNORM_SRGB` swapchains) on Virtual Desktop's VDXR runtime, Quest 3. Diagnosed from the layer's and plugin's diagnostic logs.
+
+| # | Symptom | Cause | Fix |
+|---|---|---|---|
+| F1 | Game could never attach while OBS ran as admin | Mapping created by an elevated process gets an admin-only default DACL | Explicit DACL granting Authenticated Users (`cb18c91`) |
+| F2 | Layer never loaded into the game | VD's `ovr_Detect()` injection path only loads **HKLM** implicit layers; ours was HKCU | Installer copies to Program Files and registers under HKLM (`198c215`) |
+| F3 | Auto switched to OpenXR but showed nothing; "unsupported format (DXGI 29)" | `gs_texture_open_shared` can't represent `*_UNORM_SRGB` | Open the texture on OBS's device directly, choose the format from DXGI (`ebf5ef1`) |
+| F4 | Capture dropped for ~1 s mid-game | 2 s producer heartbeat timeout vs. multi-second level-load frame gaps | 10 s timeout; clean exits still detected immediately (`6906794`) |
+
+Result: Auto mode captures the VDXR game end to end ("receiving OpenXR frames (left eye, 2112x2304)").
+
+---
+
 ## TL;DR
 
 The **SteamVR/OpenVR path is mostly sound**. It has one real lifecycle bug (a zombie `VRSystem` after SteamVR quits) and a few smaller issues.
