@@ -86,6 +86,12 @@ private:
     bool m_isD3D12 = false;
     D3D12Interop m_d3d12;
 
+    // Last state written to the diagnostic log (see layer_log.h), so only
+    // changes are logged. Touched only from xrEndFrame/xrDestroySession.
+    bool m_loggedAttached = false;
+    bool m_loggedConnected = false;
+    uint32_t m_loggedEyeMask = 0;
+
     // Caller holds m_swapchainMutex. Drops swapchain state and the graphics
     // objects (wrapped D3D12 images before the D3D11On12 device).
     void ResetGraphicsLocked();

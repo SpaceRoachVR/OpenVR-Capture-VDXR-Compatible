@@ -1,5 +1,6 @@
 #include "layer_ipc_producer.h"
 #include "../../shared/vr_shared_texture.h"
+#include "layer_log.h"
 #include <algorithm>
 
 namespace vrcapture {
@@ -123,17 +124,32 @@ bool LayerIpcProducer::TryAttach()
     // OBS owns the mapping; never create it here (see vr_ipc_types.h).
     HANDLE hMap = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, VR_IPC_SHARED_MEMORY_NAME);
     if (!hMap) {
+        const DWORD err = GetLastError();
+        if (err != m_lastAttachError) {
+            // 2 = OBS not running / no VR Capture source; 5 = access denied.
+            LayerLog("attach: OpenFileMapping failed, error %lu%s", err,
+                     err == ERROR_FILE_NOT_FOUND ? " (OBS not running or no VR Capture source)"
+                     : err == ERROR_ACCESS_DENIED ? " (access denied - permissions/elevation mismatch)"
+                                                  : "");
+            m_lastAttachError = err;
+        }
         return false;
     }
 
     auto *header = reinterpret_cast<VRSharedFrameHeader *>(
         MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(VRSharedFrameHeader)));
     if (!header) {
+        LayerLog("attach: MapViewOfFile failed, error %lu", GetLastError());
         CloseHandle(hMap);
         return false;
     }
 
     if (header->magic != VR_IPC_MAGIC || header->version != VR_IPC_VERSION) {
+        if (m_lastAttachError != 0xFFFFFFFF) {
+            LayerLog("attach: OBS mapping has magic 0x%08x version %u, expected version %u (plugin/layer mismatch)",
+                     header->magic, header->version, VR_IPC_VERSION);
+            m_lastAttachError = 0xFFFFFFFF;
+        }
         // Not initialized yet, or a plugin/layer version mismatch.
         UnmapViewOfFile(header);
         CloseHandle(hMap);
@@ -142,6 +158,7 @@ bool LayerIpcProducer::TryAttach()
 
     m_hMapFile = hMap;
     m_sharedHeader = header;
+    m_lastAttachError = 0;
 
     // A previous session may have left handles behind; start clean.
     InterlockedIncrement(&m_sharedHeader->seq);
@@ -184,8 +201,11 @@ bool LayerIpcProducer::Initialize(VREyeSelection eye, ID3D11Device *device, uint
     // so the app's xrEndFrame never waits on CreateTexture2D.
     EyeSlot fresh;
     if (!CreateSharedD3D11Texture(device, width, height, format, fresh.texture, fresh.keyedMutex, fresh.sharedHandle)) {
+        LayerLog("eye %u: creating %ux%u shared texture (DXGI format %d) failed", index, width, height, (int)format);
         return false;
     }
+    LayerLog("eye %u: shared texture %ux%u DXGI format %d, keyed mutex %s", index, width, height, (int)format,
+             fresh.keyedMutex ? "yes" : "no");
     fresh.width = width;
     fresh.height = height;
     fresh.format = format;
@@ -321,6 +341,10 @@ bool LayerIpcProducer::CopyEye(VREyeSelection eye, ID3D11DeviceContext *context,
 
     if (slot.keyedMutex) {
         slot.keyedMutex->ReleaseSync(1); // Hand key 1 to the OBS consumer
+    }
+    if (!slot.loggedFirstCopy) {
+        LayerLog("eye %u: first frame copied", index);
+        slot.loggedFirstCopy = true;
     }
 
     InterlockedIncrement(&m_sharedHeader->seq);

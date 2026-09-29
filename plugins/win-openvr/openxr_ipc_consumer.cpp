@@ -312,6 +312,10 @@ bool OpenXrIpcConsumer::UpdateTexture(VREyeSelection eyeSel)
         if ((snap.shared_handle >> 32) == 0) {
             eye.sharedTexture = gs_texture_open_shared(static_cast<uint32_t>(snap.shared_handle));
         }
+        if (!eye.sharedTexture) {
+            blog(LOG_WARNING, "[win_vrcapture] could not open the game's shared texture for eye %u (handle 0x%llx)",
+                 eyeIndex, (unsigned long long)snap.shared_handle);
+        }
         if (eye.sharedTexture) {
             eye.sharedHandle = snap.shared_handle;
             auto *d3dTex = reinterpret_cast<ID3D11Texture2D *>(gs_texture_get_obj(eye.sharedTexture));

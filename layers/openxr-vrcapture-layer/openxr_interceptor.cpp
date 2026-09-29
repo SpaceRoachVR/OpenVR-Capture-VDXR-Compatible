@@ -1,4 +1,5 @@
 #include "openxr_interceptor.h"
+#include "layer_log.h"
 #include <string.h>
 #include <algorithm>
 
@@ -82,6 +83,7 @@ XrResult OpenXRInterceptor::xrCreateSession(XrInstance instance, const XrSession
     }
     const XrResult result = m_pfnCreateSession(instance, createInfo, session);
     if (XR_FAILED(result) || !createInfo) {
+        LayerLog("xrCreateSession: runtime returned %d", (int)result);
         return result;
     }
 
@@ -105,6 +107,7 @@ XrResult OpenXRInterceptor::xrCreateSession(XrInstance instance, const XrSession
     if (d3d11 && d3d11->device) {
         m_d3d11Device = d3d11->device;
         m_d3d11Device->GetImmediateContext(m_d3d11Context.GetAddressOf());
+        LayerLog("xrCreateSession: D3D11 session - capturable");
     } else if (d3d12 && d3d12->device && d3d12->queue) {
         // D3D12: layer a D3D11 device over the app's device and queue and
         // capture through it (see D3D12Interop). Other graphics APIs
@@ -113,7 +116,12 @@ XrResult OpenXRInterceptor::xrCreateSession(XrInstance instance, const XrSession
             m_d3d11Device = m_d3d12.Device();
             m_d3d11Context = m_d3d12.Context();
             m_isD3D12 = true;
+            LayerLog("xrCreateSession: D3D12 session - capturable via D3D11On12");
+        } else {
+            LayerLog("xrCreateSession: D3D12 session but D3D11On12 setup failed - not capturable");
         }
+    } else {
+        LayerLog("xrCreateSession: no D3D11/D3D12 graphics binding (Vulkan/OpenGL?) - not capturable");
     }
     return result;
 }
@@ -124,8 +132,11 @@ XrResult OpenXRInterceptor::xrDestroySession(XrSession session)
 
     // Safe teardown point for the worker: an ordinary app-driven call, not the
     // loader lock.
+    LayerLog("xrDestroySession");
     m_ipc.StopWorker();
     m_ipc.Shutdown();
+    m_loggedAttached = m_loggedConnected = false;
+    m_loggedEyeMask = 0;
 
     {
         std::lock_guard<std::mutex> lock(m_swapchainMutex);
@@ -155,6 +166,9 @@ XrResult OpenXRInterceptor::xrCreateSwapchain(XrSession session, const XrSwapcha
         info.format = static_cast<DXGI_FORMAT>(createInfo->format);
         info.usageFlags = createInfo->usageFlags;
         m_swapchains[*swapchain] = info;
+        LayerLog("xrCreateSwapchain %p: %ux%u format %lld array %u mips %u samples %u usage 0x%llx",
+                 (void *)*swapchain, info.width, info.height, (long long)createInfo->format, info.arraySize,
+                 info.mipCount, info.sampleCount, (unsigned long long)info.usageFlags);
     }
 
     return result;
@@ -199,6 +213,7 @@ XrResult OpenXRInterceptor::xrEnumerateSwapchainImages(XrSwapchain swapchain, ui
                 for (uint32_t i = 0; i < count; ++i) {
                     it->second.d3d11_textures[i] = d3d11Images[i].texture;
                 }
+                LayerLog("xrEnumerateSwapchainImages %p: %u D3D11 images", (void *)swapchain, count);
             } else if (images->type == XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR && m_d3d12.IsValid() &&
                        (it->second.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT)) {
                 // Only color swapchains can be projection views; wrapping
@@ -207,10 +222,20 @@ XrResult OpenXRInterceptor::xrEnumerateSwapchainImages(XrSwapchain swapchain, ui
                 uint32_t count = imageCountOutput ? *imageCountOutput : imageCapacityInput;
                 count = (std::min)(count, imageCapacityInput);
                 it->second.d3d11_textures.resize(count);
+                uint32_t wrappedOk = 0;
                 for (uint32_t i = 0; i < count; ++i) {
                     it->second.d3d11_textures[i] = m_d3d12.Wrap(d3d12Images[i].texture);
+                    wrappedOk += it->second.d3d11_textures[i] ? 1 : 0;
                 }
+                LayerLog("xrEnumerateSwapchainImages %p: %u D3D12 images, %u wrapped", (void *)swapchain, count,
+                         wrappedOk);
+            } else {
+                LayerLog("xrEnumerateSwapchainImages %p: image type %d not captured", (void *)swapchain,
+                         (int)images->type);
             }
+        } else {
+            LayerLog("xrEnumerateSwapchainImages %p: swapchain was never seen by xrCreateSwapchain",
+                     (void *)swapchain);
         }
     }
 
@@ -273,6 +298,18 @@ bool OpenXRInterceptor::CaptureView(VREyeSelection eye, const XrCompositionLayer
     {
         std::lock_guard<std::mutex> lock(m_swapchainMutex);
         auto it = m_swapchains.find(swapchain);
+        if (it == m_swapchains.end()) {
+            LAYER_LOG_ONCE("capture: projection view uses swapchain %p that was never seen", (void *)swapchain);
+        } else if (it->second.d3d11_textures.empty()) {
+            LAYER_LOG_ONCE("capture: swapchain %p has no captured images (not enumerated / unsupported type)",
+                           (void *)swapchain);
+        } else if (it->second.sampleCount > 1) {
+            LAYER_LOG_ONCE("capture: swapchain %p is MSAA (%u samples) - not captured", (void *)swapchain,
+                           it->second.sampleCount);
+        } else if (it->second.currentImageIndex >= it->second.d3d11_textures.size()) {
+            LAYER_LOG_ONCE("capture: image index %u out of range (%zu images)", it->second.currentImageIndex,
+                           it->second.d3d11_textures.size());
+        }
         if (it != m_swapchains.end() && !it->second.d3d11_textures.empty() && it->second.sampleCount <= 1) {
             // Use the image actually submitted this frame (tracked via
             // xrAcquireSwapchainImage/xrReleaseSwapchainImage), not a fixed
@@ -304,6 +341,8 @@ bool OpenXRInterceptor::CaptureView(VREyeSelection eye, const XrCompositionLayer
     // The rect comes from the app; never let it drive an out-of-bounds copy.
     if (cropX < 0 || cropY < 0 || cropWidth <= 0 || cropHeight <= 0 || cropX + cropWidth > swapWidth ||
         cropY + cropHeight > swapHeight || arrayIndex >= swapArraySize) {
+        LAYER_LOG_ONCE("capture: view rect (%lld,%lld %lldx%lld) layer %u outside swapchain %ux%u array %u",
+                       cropX, cropY, cropWidth, cropHeight, arrayIndex, swapWidth, swapHeight, swapArraySize);
         return false;
     }
 
@@ -345,9 +384,33 @@ XrResult OpenXRInterceptor::xrEndFrame(XrSession session, const XrFrameEndInfo *
 {
     ResolveProc(m_nextGetInstanceProcAddr, m_instance, "xrEndFrame", m_pfnEndFrame);
 
+    if (frameEndInfo) {
+        LAYER_LOG_ONCE("first xrEndFrame: %u layer(s), first type %d, capturable session: %s",
+                       frameEndInfo->layerCount,
+                       (frameEndInfo->layerCount && frameEndInfo->layers[0]) ? (int)frameEndInfo->layers[0]->type : -1,
+                       (m_d3d11Device && m_d3d11Context) ? "yes" : "no");
+    }
+
     // Only D3D11 sessions are capturable, so only those attach to OBS's
     // mapping; TryAttach is throttled and costs nothing once attached.
-    if (frameEndInfo && m_d3d11Device && m_d3d11Context && m_ipc.TryAttach() && m_ipc.IsObsConnected()) {
+    const bool attached = frameEndInfo && m_d3d11Device && m_d3d11Context && m_ipc.TryAttach();
+    const bool connected = attached && m_ipc.IsObsConnected();
+    if (attached != m_loggedAttached) {
+        LayerLog(attached ? "attached to OBS shared memory" : "detached from OBS shared memory");
+        m_loggedAttached = attached;
+    }
+    if (connected != m_loggedConnected) {
+        LayerLog(connected ? "OBS has a visible VR Capture source: capturing" : "no visible OBS source: idle");
+        m_loggedConnected = connected;
+    }
+    if (connected) {
+        const uint32_t mask = m_ipc.GetRequestedEyeMask();
+        if (mask != m_loggedEyeMask) {
+            LayerLog("OBS requests eyes: %s%s", (mask & 1) ? "left " : "", (mask & 2) ? "right" : "");
+            m_loggedEyeMask = mask;
+        }
+    }
+    if (connected) {
         for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
             if (!frameEndInfo->layers[i]) continue;
 
@@ -367,6 +430,7 @@ XrResult OpenXRInterceptor::xrEndFrame(XrSession session, const XrFrameEndInfo *
                         anyCopied |= CaptureView(eye, proj->views[viewIndex]);
                     }
                     if (anyCopied) {
+                        LAYER_LOG_ONCE("first frame handed to OBS");
                         if (m_isD3D12) {
                             // Submit the copies to the app's queue, ordered
                             // after the frame's own rendering work.
@@ -377,6 +441,15 @@ XrResult OpenXRInterceptor::xrEndFrame(XrSession session, const XrFrameEndInfo *
                 }
                 break; // Handled projection layer
             }
+        }
+        bool sawProjection = false;
+        for (uint32_t i = 0; i < frameEndInfo->layerCount; ++i) {
+            sawProjection |= frameEndInfo->layers[i] && frameEndInfo->layers[i]->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION;
+        }
+        if (!sawProjection && frameEndInfo->layerCount > 0) {
+            LAYER_LOG_ONCE("capture: frame has %u layer(s) but no projection layer (first type %d)",
+                           frameEndInfo->layerCount,
+                           frameEndInfo->layers[0] ? (int)frameEndInfo->layers[0]->type : -1);
         }
     }
 

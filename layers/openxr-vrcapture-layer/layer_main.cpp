@@ -2,6 +2,7 @@
 #include <openxr/openxr.h>
 #include <openxr/openxr_loader_negotiation.h>
 #include "openxr_interceptor.h"
+#include "layer_log.h"
 #include <string.h>
 
 using namespace vrcapture;
@@ -39,10 +40,18 @@ static XrResult XRAPI_CALL Hook_xrCreateApiLayerInstance(
 {
     // Validate the loader-supplied structs before trusting any of their
     // pointers: a layout mismatch here reads garbage and crashes the host app.
+    LayerLog("xrCreateApiLayerInstance: app='%s' engine='%s' api=%llu.%llu",
+             info ? info->applicationInfo.applicationName : "?", info ? info->applicationInfo.engineName : "?",
+             info ? (unsigned long long)XR_VERSION_MAJOR(info->applicationInfo.apiVersion) : 0ull,
+             info ? (unsigned long long)XR_VERSION_MINOR(info->applicationInfo.apiVersion) : 0ull);
+
     if (!layerInfo ||
         layerInfo->structType != XR_LOADER_INTERFACE_STRUCT_API_LAYER_CREATE_INFO ||
         layerInfo->structVersion != XR_API_LAYER_CREATE_INFO_STRUCT_VERSION ||
         layerInfo->structSize != sizeof(XrApiLayerCreateInfo)) {
+        LayerLog("xrCreateApiLayerInstance: unexpected XrApiLayerCreateInfo (type %d version %u size %zu)",
+                 layerInfo ? (int)layerInfo->structType : -1, layerInfo ? layerInfo->structVersion : 0,
+                 layerInfo ? layerInfo->structSize : 0);
         return XR_ERROR_INITIALIZATION_FAILED;
     }
 
@@ -53,6 +62,7 @@ static XrResult XRAPI_CALL Hook_xrCreateApiLayerInstance(
         nextInfo->structSize != sizeof(XrApiLayerNextInfo) ||
         !nextInfo->nextGetInstanceProcAddr ||
         !nextInfo->nextCreateApiLayerInstance) {
+        LayerLog("xrCreateApiLayerInstance: unexpected XrApiLayerNextInfo");
         return XR_ERROR_INITIALIZATION_FAILED;
     }
 
@@ -67,6 +77,7 @@ static XrResult XRAPI_CALL Hook_xrCreateApiLayerInstance(
 
     if (g_nextCreateApiLayerInstance) {
         XrResult result = g_nextCreateApiLayerInstance(info, &nextLayerInfo, instance);
+        LayerLog("xrCreateApiLayerInstance: next layer/runtime returned %d", (int)result);
         if (XR_SUCCEEDED(result) && instance) {
             OpenXRInterceptor::Get().SetInstance(*instance);
         }
@@ -86,6 +97,11 @@ extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderApiLayerIn
     if (!loaderInfo || !apiLayerRequest) {
         return XR_ERROR_INITIALIZATION_FAILED;
     }
+
+    // Being negotiated means we're loaded into an OpenXR app: start logging.
+    LayerLogEnabled().store(true);
+    LayerLog("layer loaded: negotiating as '%s' (loader interface %u-%u)", apiLayerName ? apiLayerName : "?",
+             loaderInfo->minInterfaceVersion, loaderInfo->maxInterfaceVersion);
 
     if (loaderInfo->structType != XR_LOADER_INTERFACE_STRUCT_LOADER_INFO ||
         loaderInfo->structVersion != XR_LOADER_INFO_STRUCT_VERSION ||

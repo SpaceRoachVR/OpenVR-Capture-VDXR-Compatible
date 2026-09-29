@@ -59,6 +59,8 @@ static std::atomic<uint64_t> s_openvr_mirror_generation{0};
 
 #define blog(log_level, message, ...) \
 	blog(log_level, "[win_vrcapture] " message, ##__VA_ARGS__)
+#define info(message, ...) \
+	blog(LOG_INFO, "[%s] " message, (context && context->source) ? obs_source_get_name(context->source) : "win_vrcapture", ##__VA_ARGS__)
 #define warn(message, ...) \
 	blog(LOG_WARNING, "[%s] " message, (context && context->source) ? obs_source_get_name(context->source) : "win_vrcapture", ##__VA_ARGS__)
 
@@ -125,6 +127,11 @@ struct win_openvr {
 	// s_openvr_generation of the runtime this source's reference belongs to
 	uint64_t init_generation = 0;
 	uint64_t mirror_generation = 0;
+
+	// Last values written to the OBS log, so only changes are logged.
+	int logged_engine = -1;
+	bool logged_openxr_active = false;
+	bool logged_openxr_frame = false;
 
 	// Per-instance throttle/re-entrancy state
 	std::atomic<bool> init_inprog{false};
@@ -736,10 +743,28 @@ static void win_openvr_tick(void *data, float seconds)
 		}
 	}
 
+	if (uses_openxr_ipc(context) && openxr_active != context->logged_openxr_active) {
+		info("OpenXR game %s", openxr_active ? "detected (capture layer connected)" : "no longer detected");
+		context->logged_openxr_active = openxr_active;
+	}
+	if (static_cast<int>(context->active_engine) != context->logged_engine) {
+		static const char *const names[] = {"Auto", "OpenXR/VDXR", "SteamVR"};
+		const int engine = static_cast<int>(context->active_engine);
+		info("capture engine: %s (mode setting: %s)", names[engine], names[static_cast<int>(context->engine_mode)]);
+		context->logged_engine = engine;
+		context->logged_openxr_frame = false;
+	}
+
 	// Update OpenXR if active
 	if (context->active_engine == CaptureEngineMode::OpenXR_VDXR && context->openxr_consumer && context->active.load()) {
 		const vrcapture::VREyeSelection eye = openxr_eye(context);
-		if (context->openxr_consumer->UpdateTexture(eye)) {
+		const bool haveFrame = context->openxr_consumer->UpdateTexture(eye);
+		if (haveFrame && !context->logged_openxr_frame) {
+			info("receiving OpenXR frames (%s eye, %ux%u)", context->righteye ? "right" : "left",
+			     context->openxr_consumer->GetWidth(eye), context->openxr_consumer->GetHeight(eye));
+			context->logged_openxr_frame = true;
+		}
+		if (haveFrame) {
 			const uint32_t w = context->openxr_consumer->GetWidth(eye);
 			const uint32_t h = context->openxr_consumer->GetHeight(eye);
 			std::lock_guard<std::mutex> lock(context->mutex);

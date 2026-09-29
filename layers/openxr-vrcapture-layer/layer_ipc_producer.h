@@ -68,6 +68,7 @@ private:
         uint32_t width = 0;
         uint32_t height = 0;
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        bool loggedFirstCopy = false;
     };
 
     struct PendingInit {
@@ -91,6 +92,7 @@ private:
     HANDLE m_hMapFile = nullptr;
     VRSharedFrameHeader *m_sharedHeader = nullptr;
     uint64_t m_lastAttachAttempt = 0;
+    DWORD m_lastAttachError = 0; // last attach failure logged, to log changes only
 
     // D3D11 shared resources
     ComPtr<ID3D11Device> m_device;
