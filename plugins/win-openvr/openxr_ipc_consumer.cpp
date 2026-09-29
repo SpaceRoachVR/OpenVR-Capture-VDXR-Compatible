@@ -249,9 +249,15 @@ bool OpenXrIpcConsumer::IsProducerActive()
         return false;
     }
 
+    // A game that exits normally marks the header Inactive at once (the
+    // layer's xrDestroySession). The heartbeat only has to catch a game that
+    // died without doing that, so it can be generous: games routinely stop
+    // submitting frames for a few seconds during level loads, and a short
+    // timeout made Auto drop the capture (and its last frame) mid-game.
+    constexpr uint64_t kProducerTimeoutMs = 10000;
     uint64_t now = GetTickCount64();
     if (m_sharedHeader->active_backend == VRBackendType::OpenXR_VDXR &&
-        (now - m_sharedHeader->last_producer_heartbeat < 2000)) {
+        (now - m_sharedHeader->last_producer_heartbeat < kProducerTimeoutMs)) {
         return true;
     }
 
