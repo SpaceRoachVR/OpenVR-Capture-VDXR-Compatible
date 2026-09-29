@@ -30,6 +30,13 @@ int main()
 		return 2;
 	}
 
+	if (HeaderView().hdr) {
+		// The test drives the mapping's whole lifecycle itself; a running OBS
+		// (or fake_producer attached to one) already owns it.
+		std::printf("SKIPPED: the IPC shared memory already exists - close OBS and rerun\n");
+		return 2;
+	}
+
 	std::printf("1. game running, OBS not running\n");
 	{
 		LayerIpcProducer producer;

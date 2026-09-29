@@ -33,30 +33,65 @@ inline void LayerLog(const char *fmt, ...)
 
     static wchar_t s_path[MAX_PATH] = {};
     static char s_exe[MAX_PATH] = {};
+    static bool s_failed = false;
+    if (s_failed) {
+        return;
+    }
+    bool firstLine = false;
+    FILE *f = nullptr;
     if (!s_path[0]) {
-        wchar_t dir[MAX_PATH] = {};
-        if (!GetEnvironmentVariableW(L"LOCALAPPDATA", dir, MAX_PATH)) {
-            return;
-        }
-        wcscat_s(dir, L"\\SpaceRoachVR");
-        CreateDirectoryW(dir, nullptr);
-        swprintf_s(s_path, L"%s\\openxr-vrcapture-layer.log", dir);
-
         char full[MAX_PATH] = {};
         GetModuleFileNameA(nullptr, full, MAX_PATH);
         const char *base = strrchr(full, '\\');
         strcpy_s(s_exe, base ? base + 1 : full);
 
-        // Keep the file bounded: start over once it passes 1 MB.
-        WIN32_FILE_ATTRIBUTE_DATA info = {};
-        if (GetFileAttributesExW(s_path, GetFileExInfoStandard, &info) && info.nFileSizeLow > 1024 * 1024) {
-            DeleteFileW(s_path);
+        // Candidate folders, in order: %LOCALAPPDATA%\SpaceRoachVR, then the
+        // folder this layer DLL lives in. A game started by a service can
+        // inherit an environment whose LOCALAPPDATA isn't writable (or isn't
+        // the user's), so don't rely on it alone.
+        wchar_t candidates[2][MAX_PATH] = {};
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", candidates[0], MAX_PATH)) {
+            wcscat_s(candidates[0], L"\\SpaceRoachVR");
+            CreateDirectoryW(candidates[0], nullptr);
         }
+        HMODULE self = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCWSTR>(&LayerLogEnabled), &self) &&
+            GetModuleFileNameW(self, candidates[1], MAX_PATH)) {
+            wchar_t *slash = wcsrchr(candidates[1], L'\\');
+            if (slash) *slash = 0;
+        }
+        for (auto &dir : candidates) {
+            if (!dir[0]) continue;
+            swprintf_s(s_path, L"%s\\openxr-vrcapture-layer.log", dir);
+            // Keep the file bounded: start over once it passes 1 MB.
+            WIN32_FILE_ATTRIBUTE_DATA info = {};
+            if (GetFileAttributesExW(s_path, GetFileExInfoStandard, &info) && info.nFileSizeLow > 1024 * 1024) {
+                DeleteFileW(s_path);
+            }
+            if (_wfopen_s(&f, s_path, L"a") == 0 && f) {
+                break;
+            }
+            f = nullptr;
+        }
+        if (!f) {
+            s_failed = true;
+            return;
+        }
+        firstLine = true;
+    } else if (_wfopen_s(&f, s_path, L"a") != 0 || !f) {
+        return;
     }
 
-    FILE *f = nullptr;
-    if (_wfopen_s(&f, s_path, L"a") != 0 || !f) {
-        return;
+    if (firstLine) {
+        // Identify the process context once: which session/user it runs in
+        // matters for the "Local\" shared-memory namespace OBS uses.
+        DWORD session = 0;
+        ProcessIdToSessionId(GetCurrentProcessId(), &session);
+        char localAppData[MAX_PATH] = "(unset)";
+        GetEnvironmentVariableA("LOCALAPPDATA", localAppData, MAX_PATH);
+        fprintf(f, "---- %s pid %lu, session %lu, LOCALAPPDATA=%s\n", s_exe, GetCurrentProcessId(), session,
+                localAppData);
     }
     SYSTEMTIME t;
     GetLocalTime(&t);
