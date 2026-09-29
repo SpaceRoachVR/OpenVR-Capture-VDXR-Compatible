@@ -61,7 +61,7 @@ private:
     struct EyeState {
         // Producer's texture, opened on OBS's device. Only touched in
         // UpdateTexture while holding its keyed mutex (when it has one).
-        gs_texture_t *sharedTexture = nullptr;
+        ComPtr<ID3D11Texture2D> sharedTexture;
         ComPtr<IDXGIKeyedMutex> keyedMutex;
         uint64_t sharedHandle = 0;
 

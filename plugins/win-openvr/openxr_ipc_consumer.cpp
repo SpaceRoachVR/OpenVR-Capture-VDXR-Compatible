@@ -147,12 +147,7 @@ bool OpenXrIpcConsumer::InitializeLocked()
 void OpenXrIpcConsumer::DestroySharedTexture(EyeState &eye)
 {
     eye.keyedMutex.Reset();
-    if (eye.sharedTexture) {
-        obs_enter_graphics();
-        gs_texture_destroy(eye.sharedTexture);
-        obs_leave_graphics();
-        eye.sharedTexture = nullptr;
-    }
+    eye.sharedTexture.Reset();
     eye.sharedHandle = 0;
 }
 
@@ -305,37 +300,42 @@ bool OpenXrIpcConsumer::UpdateTexture(VREyeSelection eyeSel)
 
     obs_enter_graphics();
 
-    if (snap.shared_handle != eye.sharedHandle || !eye.sharedTexture) {
+    // The game's texture is opened directly on OBS's D3D11 device, not via
+    // gs_texture_open_shared: OBS can't represent common swapchain formats
+    // such as R8G8B8A8_UNORM_SRGB, and we only ever copy out of it anyway.
+    auto *obsDevice = gs_get_device_type() == GS_DEVICE_DIRECT3D_11
+                          ? static_cast<ID3D11Device *>(gs_get_device_obj())
+                          : nullptr;
+
+    if (obsDevice && (snap.shared_handle != eye.sharedHandle || !eye.sharedTexture)) {
         DestroySharedTexture(eye);
 
-        // Legacy (GetSharedHandle) DXGI handles are 32-bit values by design.
-        if ((snap.shared_handle >> 32) == 0) {
-            eye.sharedTexture = gs_texture_open_shared(static_cast<uint32_t>(snap.shared_handle));
-        }
-        if (!eye.sharedTexture) {
-            blog(LOG_WARNING, "[win_vrcapture] could not open the game's shared texture for eye %u (handle 0x%llx)",
-                 eyeIndex, (unsigned long long)snap.shared_handle);
-        }
-        if (eye.sharedTexture) {
+        HRESULT hr = obsDevice->OpenSharedResource(reinterpret_cast<HANDLE>(snap.shared_handle),
+                                                   IID_PPV_ARGS(eye.sharedTexture.GetAddressOf()));
+        if (FAILED(hr) || !eye.sharedTexture) {
+            eye.sharedTexture.Reset();
+            blog(LOG_WARNING,
+                 "[win_vrcapture] could not open the game's shared texture for eye %u (handle 0x%llx, hr 0x%08lx)",
+                 eyeIndex, (unsigned long long)snap.shared_handle, hr);
+        } else {
             eye.sharedHandle = snap.shared_handle;
-            auto *d3dTex = reinterpret_cast<ID3D11Texture2D *>(gs_texture_get_obj(eye.sharedTexture));
-            if (d3dTex) {
-                d3dTex->QueryInterface(__uuidof(IDXGIKeyedMutex), reinterpret_cast<void **>(eye.keyedMutex.GetAddressOf()));
-            }
+            eye.sharedTexture.As(&eye.keyedMutex); // absent on the no-keyed-mutex fallback path
         }
     }
 
     if (eye.sharedTexture) {
-        // Size/format come from the texture OBS actually opened, not the
-        // header, so the private copy always matches what we copy from.
-        const uint32_t w = gs_texture_get_width(eye.sharedTexture);
-        const uint32_t h = gs_texture_get_height(eye.sharedTexture);
-        const gs_color_format fmt = gs_texture_get_color_format(eye.sharedTexture);
+        // Size/format come from the texture actually opened, not the header,
+        // so the private copy always matches what we copy from.
+        D3D11_TEXTURE2D_DESC desc = {};
+        eye.sharedTexture->GetDesc(&desc);
+        const uint32_t w = desc.Width;
+        const uint32_t h = desc.Height;
+        const gs_color_format fmt = GsFormatForSwapchainContent(desc.Format);
 
         if (fmt == GS_UNKNOWN) {
             if (!m_loggedBadFormat) {
-                blog(LOG_WARNING, "[win_vrcapture] OpenXR shared texture has an unsupported format (DXGI %u)",
-                     m_sharedHeader->eyes[eyeIndex].dxgi_format);
+                blog(LOG_WARNING, "[win_vrcapture] OpenXR shared texture has an unsupported format (DXGI %d)",
+                     static_cast<int>(desc.Format));
                 m_loggedBadFormat = true;
             }
         } else {
@@ -350,7 +350,15 @@ bool OpenXrIpcConsumer::UpdateTexture(VREyeSelection eyeSel)
                 eye.hasFrame = false;
             }
 
-            if (eye.privateTexture) {
+            // Same device as the shared texture, so this is a plain GPU copy on
+            // OBS's own context (graphics thread, inside the graphics lock).
+            auto *dst = eye.privateTexture ? static_cast<ID3D11Texture2D *>(gs_texture_get_obj(eye.privateTexture))
+                                           : nullptr;
+            ComPtr<ID3D11DeviceContext> obsContext;
+            obsDevice->GetImmediateContext(obsContext.GetAddressOf());
+            auto copyFrame = [&]() { obsContext->CopyResource(dst, eye.sharedTexture.Get()); };
+
+            if (dst && obsContext) {
                 if (eye.keyedMutex) {
                     // Take the frame only when the producer has handed us
                     // key 1 (i.e. there is a new one), copy it out, and give
@@ -359,14 +367,14 @@ bool OpenXrIpcConsumer::UpdateTexture(VREyeSelection eyeSel)
                     // texture, so every render call this OBS frame -- preview,
                     // program, projectors -- sees the same image.
                     if (eye.keyedMutex->AcquireSync(1, 0) == S_OK) {
-                        gs_copy_texture(eye.privateTexture, eye.sharedTexture);
+                        copyFrame();
                         eye.keyedMutex->ReleaseSync(0);
                         eye.hasFrame = true;
                     }
                 } else if (snap.frame_index != eye.frameIndex || !eye.hasFrame) {
                     // Fallback texture without a keyed mutex: no cross-process
                     // sync available, so copy whenever a new frame is published.
-                    gs_copy_texture(eye.privateTexture, eye.sharedTexture);
+                    copyFrame();
                     eye.hasFrame = true;
                 }
                 eye.frameIndex = snap.frame_index;

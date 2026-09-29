@@ -4,7 +4,10 @@
 // OBS's mapping, waits for a visible OBS source, then publishes an animated
 // test pattern at a configurable rate through CopyEye/PublishFrame.
 //
-// Usage: fake_producer [fps=72] [width=3840] [height=1920]
+// Usage: fake_producer [fps=72] [width=3840] [height=1920] [srgb|unorm]
+//
+// The image format defaults to R8G8B8A8_UNORM_SRGB, what most games use for
+// their swapchains; "unorm" uses plain R8G8B8A8_UNORM (linear content).
 //
 // The image is side-by-side stereo: the left half is the left eye (marked with
 // a blue block), the right half the right eye (a red block), so left- and
@@ -36,6 +39,7 @@ int main(int argc, char **argv)
 	const int fps = argc > 1 ? std::max(1, atoi(argv[1])) : 72;
 	const UINT width = argc > 2 ? static_cast<UINT>(std::max(32, atoi(argv[2]))) & ~1u : 3840;
 	const UINT height = argc > 3 ? static_cast<UINT>(std::max(16, atoi(argv[3]))) : 1920;
+	const bool unorm = argc > 4 && _stricmp(argv[4], "unorm") == 0;
 
 	// Hardware device: OBS opens the shared handle on its own GPU device, and
 	// legacy shared handles don't cross adapters (so no WARP here).
@@ -54,7 +58,7 @@ int main(int argc, char **argv)
 	sd.Height = height;
 	sd.MipLevels = 1;
 	sd.ArraySize = 1;
-	sd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	sd.Format = unorm ? DXGI_FORMAT_R8G8B8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
 	sd.SampleDesc.Count = 1;
 	sd.Usage = D3D11_USAGE_DEFAULT;
 	sd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
@@ -67,7 +71,8 @@ int main(int argc, char **argv)
 	std::vector<uint32_t> pixels(size_t(width) * height);
 	LayerIpcProducer producer;
 
-	std::printf("fake_producer: %ux%u @ %d fps. Waiting for OBS... (Ctrl+C to quit)\n", width, height, fps);
+	std::printf("fake_producer: %ux%u @ %d fps, %s. Waiting for OBS... (Ctrl+C to quit)\n", width, height, fps,
+		    unorm ? "R8G8B8A8_UNORM" : "R8G8B8A8_UNORM_SRGB");
 
 	const auto period = std::chrono::nanoseconds(1000000000LL / fps);
 	auto next = Clock::now();

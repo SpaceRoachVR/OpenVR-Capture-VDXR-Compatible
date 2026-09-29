@@ -49,6 +49,26 @@ inline gs_color_format GsFormatForSrgbContent(DXGI_FORMAT format)
 	}
 }
 
+// gs format for an OBS-owned copy of an OpenXR swapchain image, honouring
+// what the swapchain format says about its content: *_SRGB (and typeless)
+// images hold sRGB-encoded values and get a format with an sRGB view; plain
+// UNORM and float images hold linear values (per the OpenXR spec) and get a
+// linear format. Every result has a typeless/compatible D3D11 resource format,
+// so the image can be CopyResource'd into it. Returns GS_UNKNOWN if unsupported.
+inline gs_color_format GsFormatForSwapchainContent(DXGI_FORMAT format)
+{
+	switch (format) {
+	case DXGI_FORMAT_R8G8B8A8_UNORM:
+		return GS_RGBA_UNORM;
+	case DXGI_FORMAT_B8G8R8A8_UNORM:
+		return GS_BGRA_UNORM;
+	case DXGI_FORMAT_B8G8R8X8_UNORM:
+		return GS_BGRX_UNORM;
+	default:
+		return GsFormatForSrgbContent(format);
+	}
+}
+
 // Draws the (x, y, cx, cy) sub-rectangle of `tex` at the origin with the
 // current effect's "Draw" technique. A 0 extent means "to the edge"; the
 // rectangle is clamped to the texture.
