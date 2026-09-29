@@ -18,6 +18,7 @@ A fork of OBS-OpenVR-Input-Plugin, originally made by Keijo "Kegetys" Ruotsalain
 - **Framing:** Native, 16:9, 4:3 and custom aspect ratios, zoom (1.0x–5.0x), horizontal/vertical offsets. The same settings work for both engines.
 - **GPU-only frame path:** frames are copied GPU-to-GPU. OpenXR frames are handed to OBS through a shared texture synchronized with `IDXGIKeyedMutex`; OBS always draws its own copy of the latest frame, so preview, program and projectors never flicker.
 - **Colour-correct in OBS's linear pipeline** (`OBS_SOURCE_SRGB`): sRGB content is decoded as sRGB, linear (UNORM/float) OpenXR swapchains as linear.
+- **Diagnostics:** the layer writes `%LOCALAPPDATA%\SpaceRoachVR\openxr-vrcapture-layer.log` (whether it loaded into a game, the session's graphics API, OBS connection, first frames, and why frames were skipped); the OBS log shows engine switches and when OpenXR frames arrive.
 - **Low idle cost:** OpenXR games only talk to OBS while a VR Capture source is visible, and SteamVR is only probed while it's actually running.
 
 #### What can be captured
@@ -46,7 +47,7 @@ scripts/Uninstall-OpenXR-Layer.ps1
 ```
 
 1. Copy `obs-plugins` and `data` into your OBS Studio folder (e.g. `C:\Program Files\obs-studio`).
-2. For **OpenXR / VDXR** capture, keep the layer DLL and JSON together in a permanent folder and run `scripts\Install-OpenXR-Layer.ps1` (right-click → Run with PowerShell). It registers the layer for the current user and removes older registrations. `Uninstall-OpenXR-Layer.ps1` removes it again.
+2. For **OpenXR / VDXR** capture, run `scripts\Install-OpenXR-Layer.ps1` (right-click → Run with PowerShell) and approve the administrator prompt. It copies the layer to `C:\Program Files\SpaceRoachVR\OpenXR Capture Layer` and registers it for all users (HKLM). Machine-wide registration matters: Virtual Desktop's launch path for games built on Meta's OVRPlugin only loads HKLM layers. `-CurrentUser` registers per-user (HKCU) without admin instead, but those games won't see it. `Uninstall-OpenXR-Layer.ps1` removes either kind.
 3. To stop the layer loading into one particular app, set the environment variable `DISABLE_XR_APILAYER_SPACEROACH_VR_CAPTURE=1` for that app.
 
 ---
