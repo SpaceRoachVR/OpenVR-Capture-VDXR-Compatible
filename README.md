@@ -1,68 +1,146 @@
-# VR Capture for OBS Studio (SpaceRoach Edition)
+# VR Capture for OBS Studio — SpaceRoach Edition (VDXR compatible)
 
-VR capture source for OBS Studio with support for both **OpenVR (SteamVR)** and **OpenXR / VDXR (Virtual Desktop OpenXR)**.
+Put your VR game straight into OBS at full resolution: a clean, per-eye view of what's rendered in the headset, without the black borders, lens-distorted edges or low-resolution desktop mirror window.
 
-A fork of OBS-OpenVR-Input-Plugin, originally made by Keijo "Kegetys" Ruotsalainen, expanded for modern OpenXR runtimes and the Virtual Desktop ecosystem.
+Works with **SteamVR** games and with **OpenXR games running on Virtual Desktop (VDXR)**, including Quest games launched through Virtual Desktop that never touch SteamVR.
 
-![obs64_4E9advFPF8](https://github.com/user-attachments/assets/98e52da2-f58d-4a63-a975-b07704e4a4e9)
-
----
-
-### Features
-
-- **Two capture engines**
-  - **OpenXR / VDXR:** captures the game's own swapchain through an OpenXR API layer, for games on Virtual Desktop (VDXR), Meta Quest Link and other OpenXR runtimes, without going through SteamVR.
-  - **OpenVR / SteamVR:** captures the SteamVR compositor's per-eye mirror texture.
-  - **Auto:** uses OpenXR when a capturable OpenXR game is running, SteamVR otherwise.
-- **Left or right eye per source.** Several sources (e.g. one per eye) can capture the same game at once.
-- **Framing:** Native, 16:9, 4:3 and custom aspect ratios, zoom (1.0x–5.0x), horizontal/vertical offsets. The same settings work for both engines.
-- **GPU-only frame path:** frames are copied GPU-to-GPU. OpenXR frames are handed to OBS through a shared texture synchronized with `IDXGIKeyedMutex`; OBS always draws its own copy of the latest frame, so preview, program and projectors never flicker.
-- **Colour-correct in OBS's linear pipeline** (`OBS_SOURCE_SRGB`): sRGB content is decoded as sRGB, linear (UNORM/float) OpenXR swapchains as linear.
-- **Diagnostics:** the layer writes `%LOCALAPPDATA%\SpaceRoachVR\openxr-vrcapture-layer.log` (whether it loaded into a game, the session's graphics API, OBS connection, first frames, and why frames were skipped); the OBS log shows engine switches and when OpenXR frames arrive.
-- **Low idle cost:** OpenXR games only talk to OBS while a VR Capture source is visible, and SteamVR is only probed while it's actually running.
-
-#### What can be captured
-
-| Engine | Supported | Not supported |
-|---|---|---|
-| OpenXR layer | D3D11 and D3D12 games (D3D12 via D3D11On12) | Vulkan and OpenGL games, MSAA swapchains |
-| SteamVR | Any SteamVR game (compositor mirror) | OBS set to a non-D3D11 renderer; SteamVR and OBS on different GPUs |
-
-The OBS plugin and the OpenXR layer speak a versioned protocol. **Always install both from the same build.** A mismatched pair does nothing rather than misbehave.
+![VR Capture in OBS](https://github.com/user-attachments/assets/98e52da2-f58d-4a63-a975-b07704e4a4e9)
 
 ---
 
-### Installation
+## What you get
 
-A release contains:
+- **A "VR Capture" source in OBS** that shows one eye of your VR game, at the resolution the game renders.
+- **Automatic runtime detection.** In *Auto* mode the source uses the VDXR/OpenXR capture while an OpenXR game is running and SteamVR otherwise. You don't switch anything when you change games.
+- **Stream-ready framing.** One click for **16:9**, which keeps the widest view the eye image allows, centered on where you're looking. Zoom and offsets let you fine-tune it.
+- **Smooth and colour-accurate.** Frames are copied GPU-to-GPU with no black or torn frames, and colours match the headset. Preview, Program and projectors all show the same image.
+- **Left, right or both eyes.** Add two sources for side-by-side or eye switching.
+- **Light on your system.** The capture layer stays idle inside your games (a once-a-second check for OBS) and only copies frames while OBS has a visible VR Capture source.
 
-```
-obs-plugins/64bit/win-openvr.dll
-obs-plugins/64bit/openvr_api.dll        <- required; from the OpenVR SDK (bin/win64)
-data/obs-plugins/win-openvr/locale/en-US.ini
-openxr-layer/openxr-vrcapture-layer.dll
-openxr-layer/openxr-vrcapture-layer.json
-scripts/Install-OpenXR-Layer.ps1
-scripts/Uninstall-OpenXR-Layer.ps1
-```
+## What works
 
-1. Copy `obs-plugins` and `data` into your OBS Studio folder (e.g. `C:\Program Files\obs-studio`).
-2. For **OpenXR / VDXR** capture, run `scripts\Install-OpenXR-Layer.ps1` (right-click → Run with PowerShell) and approve the administrator prompt. It copies the layer to `C:\Program Files\SpaceRoachVR\OpenXR Capture Layer` and registers it for all users (HKLM). Machine-wide registration matters: Virtual Desktop's launch path for games built on Meta's OVRPlugin only loads HKLM layers. `-CurrentUser` registers per-user (HKCU) without admin instead, but those games won't see it. `Uninstall-OpenXR-Layer.ps1` removes either kind.
-3. To stop the layer loading into one particular app, set the environment variable `DISABLE_XR_APILAYER_SPACEROACH_VR_CAPTURE=1` for that app.
+| You play... | Captured? |
+|---|---|
+| SteamVR games (any headset connected through SteamVR) | ✅ Yes, choose *SteamVR* or *Auto* |
+| Games on **Virtual Desktop with VDXR** (Quest), including Meta/Oculus-plugin games like POPULATION ONE | ✅ Yes, choose *VDXR / OpenXR* or *Auto* |
+| Other OpenXR runtimes (e.g. Quest Link's OpenXR) | ✅ Should work. The capture hooks into the game, not the runtime. |
+| OpenXR games that render with **Vulkan or OpenGL** | ❌ Not yet (Direct3D 11 and 12 games only) |
+
+Needs Windows 10/11 (64-bit) and OBS Studio 32 (tested with 32.2). Running OBS as administrator is fine.
 
 ---
+
+## Install
+
+Download the latest release zip from the [Releases page](../../releases) and unzip it. It has two parts:
+
+### 1. The OBS plugin
+
+1. **Close OBS.**
+2. Copy the `win-openvr` folder into `C:\ProgramData\obs-studio\plugins\`
+   (create the `plugins` folder if it doesn't exist). You should end up with:
+   ```
+   C:\ProgramData\obs-studio\plugins\win-openvr\bin\64bit\win-openvr.dll
+   C:\ProgramData\obs-studio\plugins\win-openvr\bin\64bit\openvr_api.dll
+   C:\ProgramData\obs-studio\plugins\win-openvr\data\locale\en-US.ini
+   ```
+   This location survives OBS updates. If you installed an older OpenVR capture plugin into `C:\Program Files\obs-studio\obs-plugins\64bit\`, delete its `win-openvr.dll` there so OBS doesn't load two copies.
+3. Start OBS.
+
+### 2. The OpenXR / VDXR capture layer (for Virtual Desktop and other OpenXR games)
+
+Skip this if you only use SteamVR.
+
+1. **Close any VR games.**
+2. In the `openxr-layer` folder, right-click **`Install-OpenXR-Layer.ps1`** → **Run with PowerShell**, and approve the administrator prompt.
+   It installs the layer to `C:\Program Files\SpaceRoachVR\OpenXR Capture Layer` and registers it for all games.
+3. Start your game (a game that was already running won't pick it up).
+
+> **Why administrator?** Virtual Desktop only loads capture layers registered for the whole machine when it launches Oculus-plugin games. A per-user install silently never loads in those games.
+
+**Always install the plugin and the layer from the same release.** They're a matched pair; a mismatched pair simply won't connect.
+
+---
+
+## Quick start
+
+1. In OBS, click **+** under *Sources* → **VR Capture**.
+2. Leave **Capture Engine** on **Auto (Detect Active Engine)**.
+3. Set **Aspect Ratio** to **16:9** for a stream-shaped picture.
+4. Start your game. The source switches to it within a second or so.
+5. Select the source and press **Ctrl+F** (*Fit to screen*) so it fills your canvas.
+
+## Settings
+
+| Setting | What it does |
+|---|---|
+| **Capture Engine** | **Auto** picks VDXR/OpenXR when an OpenXR game is running, SteamVR otherwise. Or force **VDXR / OpenXR** or **SteamVR (OpenVR)**. |
+| **Right Eye** | Checked = right eye, unchecked = left eye. Two sources, one per eye, work fine together. |
+| **Aspect Ratio** | **Native** shows the whole eye image (usually nearly square or taller than wide). **16:9** / **4:3** / **Custom** crop to that shape, keeping the widest possible view. |
+| **Ratio Width / Height** | The shape used by *Custom* (e.g. 21 : 9). |
+| **Zoom** | 1.0 = widest view. Higher values crop in toward the center of your view. |
+| **Horizontal / Vertical Offset** | Nudge the framing in pixels. The horizontal offset is mirrored for the left eye, so a left/right pair moves symmetrically. |
+
+The crop is centered on each eye's actual view direction, not the middle of the image. VR lenses see further to the outside than toward the nose, so this keeps the horizon and your focus point where you'd expect.
+
+---
+
+## Troubleshooting
+
+**The source is black with Virtual Desktop / OpenXR games**
+- Make sure OBS is open and the VR Capture source is **visible** in the current scene. The game only sends frames while it is.
+- Make sure you ran **`Install-OpenXR-Layer.ps1`** and approved the admin prompt, then **restarted the game**.
+- Check the layer's log: `%LOCALAPPDATA%\SpaceRoachVR\openxr-vrcapture-layer.log` (paste that into Explorer's address bar).
+  - **No log file, or no entry for your game:** the layer didn't load. Re-run the installer as administrator.
+  - **"no D3D11/D3D12 graphics binding":** the game uses Vulkan/OpenGL, which isn't supported yet.
+  - **"attached to OBS" but no "first frame":** the log says why frames were skipped.
+- The OBS log (*Help → Log Files → View Current Log*) shows `OpenXR game detected` and `receiving OpenXR frames` when everything is connected.
+
+**The source is black with SteamVR games**
+- SteamVR must be running, with a game or SteamVR Home.
+- OBS must use its default **Direct3D 11** renderer (*Settings → Advanced → Renderer*).
+- On PCs with two GPUs, OBS and SteamVR must run on the same GPU.
+
+**The picture is too tall / not the shape I want**
+- Set **Aspect Ratio** to **16:9** and press **Ctrl+F** on the source. *Native* is the eye's own shape, which isn't 16:9.
+
+**Colours look washed out or too bright compared to the headset**
+- Most games look identical. If one doesn't, please open an issue with the game's name; some games label their colour format in a way that needs special handling.
+
+**Excluding a game from the capture layer**
+- Set the environment variable `DISABLE_XR_APILAYER_SPACEROACH_VR_CAPTURE=1` for that game, or remove the layer completely with `Uninstall-OpenXR-Layer.ps1`.
+
+---
+
+## Credits
+
+- Original *OpenVR Capture* OBS plugin by **Keijo "Kegetys" Ruotsalainen**.
+- Maintained as [baffler/OBS-OpenVR-Input-Plugin](https://github.com/baffler/OBS-OpenVR-Input-Plugin), then forked as [Pigney/OpenVR-Capture](https://github.com/Pigney/OpenVR-Capture).
+- **SpaceRoach Edition:** OpenXR/VDXR capture layer, Auto engine detection, 16:9 framing, and a correctness overhaul, by [SpaceRoachVR](https://github.com/SpaceRoachVR).
+
+Licensed under the GNU General Public License v2.0. See [LICENSE](LICENSE).
+
+---
+
+## For developers
+
+<details>
+<summary>Building, tests and design notes</summary>
+
+### How it works
+
+- **SteamVR:** the plugin opens the SteamVR compositor's per-eye mirror texture on OBS's own D3D11 device and copies each new frame into an OBS texture.
+- **OpenXR:** an implicit OpenXR API layer (`layers/openxr-vrcapture-layer`) runs inside the game. When OBS has a visible VR Capture source, it copies the submitted eye views into shared D3D11 textures (D3D12 games through D3D11On12), synchronized with `IDXGIKeyedMutex`. It talks to OBS through a small shared-memory header (`shared/vr_ipc_types.h`) that OBS creates. The OBS side copies each new frame into its own texture, so rendering never waits on or tears against the game.
 
 ### Building
 
-Requirements: Visual Studio 2022 (MSVC, x64) and CMake ≥ 3.16. Everything else is in `deps/`:
+Requirements: Visual Studio 2022 (MSVC, x64) and CMake 3.16+. Dependencies are vendored in `deps/`:
 
-| Dependency | Version | Location |
-|---|---|---|
-| OBS SDK headers + import lib | libobs 32.2.1 (works with OBS 32.2.x) | `deps/obs` |
-| OpenVR SDK headers + import lib | 2.15.6 | `deps/openvr` |
-| OpenXR headers | OpenXR-SDK release-1.1.63 (official, unmodified) | `deps/openxr` |
-
-Each part is a standalone CMake project:
+| Dependency | Version |
+|---|---|
+| OBS SDK headers + import lib | libobs 32.2.1 |
+| OpenVR SDK headers + import lib | 2.15.6 |
+| OpenXR headers | OpenXR-SDK release-1.1.63 (official, unmodified) |
 
 ```bash
 cmake -B build/plugin -S plugins/win-openvr
@@ -76,16 +154,15 @@ cmake --build build/tests --config Release
 ctest --test-dir build/tests -C Release
 ```
 
-The layer build writes `openxr-vrcapture-layer.json` next to the DLL, and `Install-OpenXR-Layer.ps1` finds build outputs automatically. `openvr_api.dll` is not in the repo; take it from the [OpenVR SDK](https://github.com/ValveSoftware/openvr) `bin/win64` matching the header version above.
+`openvr_api.dll` isn't in the repo; take it from the [OpenVR SDK](https://github.com/ValveSoftware/openvr) `bin/win64` at the version above. For local testing, `scripts/Install-OBS-Plugin.ps1` installs a fresh plugin build into OBS (OBS closed), and `scripts/Install-OpenXR-Layer.ps1` picks up the newest layer build. The CI workflow builds everything, runs the tests, and uploads a release-shaped zip.
 
-The plugin can also be built inside an OBS source tree: copy `plugins/win-openvr` into `obs-studio/plugins/` and add `add_obs_plugin(win-openvr PLATFORMS WINDOWS)`. It links `libobs` there automatically.
+### Tests and tools
 
----
+- `ipc_handshake_test`: OBS ↔ layer protocol, per-eye requests from several sources, hide/show, and the keyed-mutex handoff with pixel checks. Needs neither OBS nor a headset (close OBS first).
+- `d3d12_capture_test`: D3D12 capture through D3D11On12 on a WARP device.
+- `crop_math_test`: aspect ratio, zoom, view-centered crop and offsets.
+- `fake_producer [fps] [width] [height] [srgb|unorm]`: pretends to be an OpenXR game and streams a side-by-side test pattern into OBS, for testing without a headset.
 
-### Testing without a headset
+`OpenVR-Capture_Correctness-Audit.md` records the correctness audit, the field-test findings and a manual test matrix.
 
-- `ipc_handshake_test` covers the OBS ↔ layer protocol: attach/detach, per-eye requests from several sources, hide/show, and the keyed-mutex handoff with pixel checks. It needs neither OBS nor a headset.
-- `d3d12_capture_test` covers the D3D12 path: a D3D12 image wrapped through D3D11On12 on WARP, copied by the real producer and read back per eye.
-- `fake_producer [fps] [width] [height]` stands in for an OpenXR game. With OBS running and a VR Capture source visible (engine Auto or VDXR / OpenXR), it streams an animated side-by-side test pattern (left eye blue marker, right eye red) through the real IPC path. Run it at an fps below OBS's (e.g. `30`) to check there's no flicker.
-
-See `OpenVR-Capture_Correctness-Audit.md` for the audit these fixes came from and a manual test matrix for headset testing.
+</details>

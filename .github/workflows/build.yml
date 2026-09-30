@@ -26,12 +26,22 @@ jobs:
           cmake --build build/tests --config Release
           ctest --test-dir build/tests -C Release --output-on-failure
 
+      # Same layout as the README's install instructions.
+      - name: Package release
+        shell: pwsh
+        run: |
+          $r = "release"
+          $bin = "$r/win-openvr/bin/64bit"
+          New-Item -ItemType Directory -Force $bin, "$r/win-openvr/data/locale", "$r/openxr-layer" | Out-Null
+          Copy-Item build/plugin/Release/win-openvr.dll $bin
+          # openvr_api.dll matching deps/openvr (2.15.6), from Valve's OpenVR SDK.
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/ValveSoftware/openvr/v2.15.6/bin/win64/openvr_api.dll" -OutFile "$bin/openvr_api.dll"
+          Copy-Item plugins/win-openvr/data/locale/* "$r/win-openvr/data/locale"
+          Copy-Item build/layers/Release/openxr-vrcapture-layer.dll, build/layers/Release/openxr-vrcapture-layer.json "$r/openxr-layer"
+          Copy-Item scripts/Install-OpenXR-Layer.ps1, scripts/Uninstall-OpenXR-Layer.ps1 "$r/openxr-layer"
+          Copy-Item README.md, LICENSE $r
+
       - uses: actions/upload-artifact@v4
         with:
-          name: vr-capture-${{ github.sha }}
-          path: |
-            build/plugin/Release/win-openvr.dll
-            plugins/win-openvr/data
-            build/layers/Release/openxr-vrcapture-layer.dll
-            build/layers/Release/openxr-vrcapture-layer.json
-            scripts/*.ps1
+          name: VR-Capture-SpaceRoach-${{ github.sha }}
+          path: release
