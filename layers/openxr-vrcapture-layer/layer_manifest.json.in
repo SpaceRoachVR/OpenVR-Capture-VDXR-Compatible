@@ -1,0 +1,14 @@
+{
+    "file_format_version": "1.0.0",
+    "api_layer": {
+        "name": "XR_APILAYER_SPACEROACH_vr_capture",
+        "type": "global",
+        "library_path": "./openxr-vrcapture-layer.dll",
+        "api_version": "1.0",
+        "implementation_version": "1",
+        "description": "SpaceRoachVR OpenXR & VDXR Capture Layer for OBS Studio",
+        "functions": {
+            "xrNegotiateLoaderApiLayerInterface": "xrNegotiateLoaderApiLayerInterface"
+        }
+    }
+}
