@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../shared/vr_ipc_types.h"
+#include "crop_math.h"
 #include <obs-module.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -52,6 +53,9 @@ public:
     gs_texture_t *GetTexture(VREyeSelection eye) const;
     uint32_t GetWidth(VREyeSelection eye) const;
     uint32_t GetHeight(VREyeSelection eye) const;
+    // Where the eye's view direction falls in its image, from the FOV the
+    // game rendered with (image center until known).
+    OpticalCenter GetOpticalCenter(VREyeSelection eye) const;
 
     // Draws the (x, y, cx, cy) sub-rectangle of the eye's latest frame at the
     // origin. Graphics thread only. Returns false if there is nothing to draw.
@@ -72,6 +76,7 @@ private:
         uint32_t width = 0;
         uint32_t height = 0;
         uint64_t frameIndex = 0;
+        OpticalCenter opticalCenter;
     };
 
     struct Client {

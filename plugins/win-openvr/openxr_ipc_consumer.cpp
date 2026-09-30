@@ -2,6 +2,7 @@
 #include "obs_draw_util.h"
 #include <sddl.h>
 #include <algorithm>
+#include <cmath>
 
 namespace vrcapture {
 
@@ -11,6 +12,7 @@ struct EyeSnapshot {
     uint32_t width;
     uint32_t height;
     uint64_t frame_index;
+    float fov[4];
 };
 
 bool ValidEye(VREyeSelection eye)
@@ -35,6 +37,9 @@ bool ReadEyeConsistent(const VRSharedFrameHeader *header, uint32_t eyeIndex, Eye
         out.width = eye.texture_width;
         out.height = eye.texture_height;
         out.frame_index = header->frame_index;
+        for (int i = 0; i < 4; ++i) {
+            out.fov[i] = eye.fov[i];
+        }
 
         _ReadWriteBarrier();
         if (header->seq == s1) {
@@ -161,6 +166,7 @@ void OpenXrIpcConsumer::DestroyEye(EyeState &eye)
         eye.privateTexture = nullptr;
     }
     eye.privateFormat = GS_UNKNOWN;
+    eye.opticalCenter = OpticalCenter{};
     eye.hasFrame = false;
     eye.width = 0;
     eye.height = 0;
@@ -296,6 +302,12 @@ bool OpenXrIpcConsumer::UpdateTexture(VREyeSelection eyeSel)
     if (!ReadEyeConsistent(m_sharedHeader, eyeIndex, snap)) {
         return eye.hasFrame; // producer busy; keep showing the last frame
     }
+    // FOV angles (radians) of the view last copied into this eye's texture;
+    // all zero until the layer has published a frame.
+    if (snap.fov[1] > snap.fov[0] && snap.fov[2] > snap.fov[3]) {
+        eye.opticalCenter = OpticalCenterFromTangents(std::tan(snap.fov[0]), std::tan(snap.fov[1]),
+                                                      std::tan(snap.fov[2]), std::tan(snap.fov[3]));
+    }
 
     // The header is written by another (untrusted-ish) process; reject
     // missing or out-of-range textures rather than acting on them.
@@ -407,6 +419,12 @@ uint32_t OpenXrIpcConsumer::GetWidth(VREyeSelection eye) const
 {
     const EyeState *e = FindEye(eye);
     return e ? e->width : 0;
+}
+
+OpticalCenter OpenXrIpcConsumer::GetOpticalCenter(VREyeSelection eye) const
+{
+    const EyeState *e = FindEye(eye);
+    return e ? e->opticalCenter : OpticalCenter{};
 }
 
 uint32_t OpenXrIpcConsumer::GetHeight(VREyeSelection eye) const

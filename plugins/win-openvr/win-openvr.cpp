@@ -25,6 +25,7 @@
 
 #include "openxr_ipc_consumer.h"
 #include "obs_draw_util.h"
+#include "crop_math.h"
 
 #if __has_include(<openvr.h>)
 #include <openvr.h>
@@ -116,6 +117,11 @@ struct win_openvr {
 	unsigned int height = 100;
 
 	double scale_factor = 1.0;
+
+	// Where each engine's eye image is centered on the view direction; the
+	// crop is centered there (see crop_math.h).
+	vrcapture::OpticalCenter openvr_center;
+	vrcapture::OpticalCenter openxr_center;
 	int x_offset = 0;
 	int y_offset = 0;
 
@@ -198,47 +204,20 @@ static void recalculate_crop_dimensions_locked(win_openvr *context)
 		return;
 	}
 
-	double scale_factor = context->scale_factor < 1.0 ? 1.0 : context->scale_factor;
-	unsigned int scaled_width = static_cast<unsigned int>(static_cast<double>(context->device_width) / scale_factor);
-	unsigned int scaled_height = static_cast<unsigned int>(static_cast<double>(context->device_height) / scale_factor);
-	scaled_width = std::clamp(scaled_width, 1u, context->device_width);
-	scaled_height = std::clamp(scaled_height, 1u, context->device_height);
-
-	context->width = scaled_width;
-	context->height = scaled_height;
-
-	if (context->ar_crop && context->active_aspect_ratio > 0.0) {
-		double input_aspect_ratio = static_cast<double>(context->width) / static_cast<double>(context->height);
-		double target_aspect_ratio = context->active_aspect_ratio;
-		if (input_aspect_ratio > target_aspect_ratio) {
-			context->width = static_cast<unsigned int>(static_cast<double>(context->height) * target_aspect_ratio);
-		} else if (input_aspect_ratio < target_aspect_ratio) {
-			context->height = static_cast<unsigned int>(static_cast<double>(context->width) / target_aspect_ratio);
-		}
-	}
-
-	int64_t device_w = context->device_width;
-	int64_t device_h = context->device_height;
-	int64_t w = std::clamp<int64_t>(context->width, 1, device_w);
-	int64_t h = std::clamp<int64_t>(context->height, 1, device_h);
-	context->width = static_cast<unsigned int>(w);
-	context->height = static_cast<unsigned int>(h);
-
-	int64_t x = 0, y = 0;
-	int64_t x_offset = context->x_offset;
-	int64_t y_offset = context->y_offset;
-	if (!context->righteye) {
-		x_offset = -x_offset;
-		x = device_w - w;
-	}
-	x += x_offset;
-	y += y_offset;
-
-	x = std::clamp<int64_t>(x, 0, std::max<int64_t>(0, device_w - w));
-	y = std::clamp<int64_t>(y, 0, std::max<int64_t>(0, device_h - h));
-
-	context->x = static_cast<unsigned int>(x);
-	context->y = static_cast<unsigned int>(y);
+	// The horizontal offset is mirrored for the left eye, so one offset value
+	// moves both eyes of a left/right source pair symmetrically.
+	const int64_t x_offset = context->righteye ? context->x_offset : -static_cast<int64_t>(context->x_offset);
+	const vrcapture::OpticalCenter center = context->active_engine == CaptureEngineMode::OpenXR_VDXR
+							? context->openxr_center
+							: context->openvr_center;
+	const vrcapture::CropRect r = vrcapture::ComputeCrop(context->device_width, context->device_height,
+							     context->scale_factor,
+							     context->ar_crop ? context->active_aspect_ratio : -1.0, center,
+							     x_offset, context->y_offset);
+	context->x = r.x;
+	context->y = r.y;
+	context->width = r.width;
+	context->height = r.height;
 }
 
 // Lock order everywhere is: OBS graphics lock, then context->mutex. render()
@@ -412,6 +391,12 @@ static void win_openvr_init(void *data, bool forced)
 	context->device_width = desc.Width;
 	context->device_height = desc.Height;
 	context->mirror_format = desc.Format;
+
+	// OpenVR's raw projection uses a y-down convention (top < 0 < bottom);
+	// convert to up/down tangents.
+	float left = 0, right = 0, top = 0, bottom = 0;
+	vr::VRSystem()->GetProjectionRaw(context->righteye ? vr::Eye_Right : vr::Eye_Left, &left, &right, &top, &bottom);
+	context->openvr_center = vrcapture::OpticalCenterFromTangents(left, right, -top, -bottom);
 
 	if (!ensure_mirror_copy_locked(context, desc)) {
 		on_failure();
@@ -767,10 +752,14 @@ static void win_openvr_tick(void *data, float seconds)
 		if (haveFrame) {
 			const uint32_t w = context->openxr_consumer->GetWidth(eye);
 			const uint32_t h = context->openxr_consumer->GetHeight(eye);
+			const vrcapture::OpticalCenter center = context->openxr_consumer->GetOpticalCenter(eye);
 			std::lock_guard<std::mutex> lock(context->mutex);
-			if (context->device_width != w || context->device_height != h) {
+			if (context->device_width != w || context->device_height != h ||
+			    std::abs(center.x - context->openxr_center.x) > 1e-4 ||
+			    std::abs(center.y - context->openxr_center.y) > 1e-4) {
 				context->device_width = w;
 				context->device_height = h;
+				context->openxr_center = center;
 				recalculate_crop_dimensions_locked(context);
 			}
 		}

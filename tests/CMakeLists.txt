@@ -60,3 +60,9 @@ target_include_directories(fake_producer PRIVATE
 	${ROOT}/shared
 )
 target_link_libraries(fake_producer PRIVATE d3d11 dxgi)
+
+add_executable(crop_math_test crop_math_test.cpp)
+target_compile_features(crop_math_test PRIVATE cxx_std_17)
+target_compile_definitions(crop_math_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(crop_math_test PRIVATE ${ROOT}/plugins/win-openvr ${ROOT}/shared)
+add_test(NAME crop_math COMMAND crop_math_test)
